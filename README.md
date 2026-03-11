@@ -16,7 +16,7 @@ A host computer analyzes results and uses **reinforcement learning (RL)** to gui
 ---
 
 # System Architecture
-
+```
 HOST PC
    │
    │ UART (FT232)
@@ -29,7 +29,7 @@ FPGA Controller (Nexys A7)
    └── UART2 → Board C
    │
    └── Trigger → Oscilloscope CH4
-
+```
 Boards → Power Shunts → Oscilloscope CH1-3
 
 The FPGA runs experiments sequentially across boards to allow clean oscilloscope captures.
@@ -150,8 +150,8 @@ Power waveforms are used to detect side-channel differences.
 ---
 
 # Repository Structure
-
-riscv-diff-fuzz-lab
+```
+archdiff-riscv
 │
 ├── README.md
 │
@@ -160,22 +160,13 @@ riscv-diff-fuzz-lab
 │   ├── uart_rx.v
 │   ├── uart_tx.v
 │   ├── nexys_a7.xdc
-│
+|
 ├── runner
 │   ├── runner_window.c
 │
 ├── host
 │   ├── rl_host.c
-│   ├── scope_capture.c
-│
-├── docs
-│   ├── architecture.png
-│   ├── wiring_diagram.png
-│
-└── scripts
-    ├── build_fpga.sh
-    ├── run_experiment.sh
-
+```
 ---
 
 # Communication Protocol
