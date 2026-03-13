@@ -157,12 +157,10 @@ archdiff-riscv
 │
 ├── fpga
 │   ├── fpga_fuzz_ctrl.v
-│   ├── uart_rx.v
-│   ├── uart_tx.v
-│   ├── nexys_a7.xdc
+│   ├── fpga_fuzz_ctrl.xdc
 |
 ├── runner
-│   ├── runner_window.c
+│   ├── runner.c
 │
 ├── host
 │   ├── rl_host.c
