@@ -54,7 +54,7 @@ FPGA -> Host:
 BUILD
 -------------------------------------------------------------------------------
 Example (Git Bash / MinGW-w64):
-  gcc -O2 -Wall -Wextra -o rl_host.exe rl_host_win.c -lm
+  gcc -O2 -Wall -Wextra -o rl_host.exe rl_host.c -lm
 
 RUN
 -------------------------------------------------------------------------------
