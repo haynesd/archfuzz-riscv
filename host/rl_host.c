@@ -174,8 +174,8 @@ typedef struct {
 static void parse_done(const char *line, int idx, triple_t *triple) {
     // Example DONE line:
     // DONE 00112233 12345678 0x5 64 987    
-    unsigned seed, flags, w;
-    unsigned long long score, wc;
+    unsigned seed, flags, worst_window;
+    unsigned long long score, worst_cycles;
 
     sscanf(line,
         "DONE %x %llu %x %u %llu",
@@ -195,24 +195,24 @@ static void parse_done(const char *line, int idx, triple_t *triple) {
 
 // Compute a reward based on the divergence of the 3 board results in the triple
 static double digital_divergence(const triple_t *t) {
-    double d01 = fabs((double)t->s[0] - (double)t->s[1]);
-    double d02 = fabs((double)t->s[0] - (double)t->s[2]);
-    double d12 = fabs((double)t->s[1] - (double)t->s[2]);
+    double d01 = fabs((double)t->score[0] - (double)t->score[1]);
+    double d02 = fabs((double)t->score[0] - (double)t->score[2]);
+    double d12 = fabs((double)t->score[1] - (double)t->score[2]);
 
     double score_term = (d01 + d02 + d12) / 1000.0;
 
     double fault_bonus = 0;
     for (int i = 0; i < 3; i++)
-        if (t->f[i] != 0) fault_bonus += 1e6;
+        if (t->flags[i] != 0) fault_bonus += 1e6;
 
     double window_bonus = 0;
-    if (!(t->w[0]==t->w[1] && t->w[1]==t->w[2]))
+    if (!(t->worst_window[0]==t->worst_window[1] && t->worst_window[1]==t->worst_window[2]))
         window_bonus += 2e5;
 
     double wc_term =
-        fabs((double)t->wc[0] - t->wc[1]) +
-        fabs((double)t->wc[0] - t->wc[2]) +
-        fabs((double)t->wc[1] - t->wc[2]);
+        fabs((double)t->worst_cycles[0] - t->worst_cycles[1]) +
+        fabs((double)t->worst_cycles[0] - t->worst_cycles[2]) +
+        fabs((double)t->worst_cycles[1] - t->worst_cycles[2]);
 
     return score_term + fault_bonus + window_bonus + wc_term;
 }
