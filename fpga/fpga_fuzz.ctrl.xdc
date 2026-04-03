@@ -29,11 +29,12 @@
 ## Clock
 set_property PACKAGE_PIN E3 [get_ports clk]
 set_property IOSTANDARD LVCMOS33 [get_ports clk]
-create_clock -add -name sys_clk_pin -period 10.000 -waveform {0 5} [get_ports clk]
+create_clock -name sys_clk_pin -period 10.000 [get_ports clk]
 
 ## Reset (active low)
 set_property PACKAGE_PIN C12 [get_ports rst_n]
 set_property IOSTANDARD LVCMOS33 [get_ports rst_n]
+set_property PULLUP true [get_ports rst_n]
 
 ## JA: Host UART + Trigger
 set_property PACKAGE_PIN C17 [get_ports uart_host_tx]
