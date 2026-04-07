@@ -1,6 +1,6 @@
 /*
 ===============================================================================
-File        : runner_windowed.c
+File        : runner.c
 Language    : C (GNU/Linux userspace)
 Target      : Linux on RISC-V boards
 Build       : GCC on-board
@@ -10,36 +10,21 @@ PURPOSE
 -------------------------------------------------------------------------------
 This program runs on each target RISC-V board in the differential lab.
 
-It waits for a command from the FPGA:
+It waits for commands from the FPGA over UART.
 
-  RUN <seed_hex8> <steps_dec>
+Supported commands:
+  1) PING
+       Input : PING\n
+       Input : PING\r\n
+       Output: PONG\n
 
-Then it executes a deterministic synthetic workload driven by the seed and
-measures timing using rdcycle. The execution is partitioned into fixed-size
-windows so the runner can localize the timing hotspot that produced the
-largest cycle cost.
+  2) RUN
+       Input : RUN <seed_hex8> <steps_dec>\n
+       Output: DONE <seed_hex8> <score_dec> <flags_hex8> <worst_window_dec> <worst_cycles_dec>\n
 
-The runner returns:
-
-  DONE <seed_hex8> <score_dec> <flags_hex8> <worst_window_dec> <worst_cycles_dec>
-
-where:
-  score         = total_cycles XOR checksum
-  flags         = anomaly flags (reserved for future expansion)
-  worst_window  = window index with highest cycle cost
-  worst_cycles  = cycle count of the worst window
-
-This provides both:
-  - whole-run divergence information
-  - sequence-localized anomaly information
-
-ASCII PROTOCOL
--------------------------------------------------------------------------------
-Input:
-  RUN 00112233 256\n
-
-Output:
-  DONE 00112233 123456789 00000000 5 1842\n
+This allows:
+  - a quick end-to-end connectivity test with PING/PONG
+  - the full deterministic workload execution with RUN
 
 BUILD
 -------------------------------------------------------------------------------
@@ -51,19 +36,6 @@ RUN
   ./runner /dev/ttyS1
 
 Replace /dev/ttyS1 with the UART device connected to the FPGA.
-
-NOTES
--------------------------------------------------------------------------------
-- This code is intended for Linux-based boards such as:
-    - VisionFive2
-    - Orange Pi RV2
-    - Lichee RV variants with Linux userspace
-- The timing source is rdcycle on RISC-V.
-- On RV64, rdcycle is read directly.
-- On RV32, rdcycleh/rdcycle is used to build a consistent 64-bit value.
-- The workload is synthetic and deterministic; it is not intended to emulate
-  a particular ISA test suite, only to create a reproducible instruction mix
-  with memory interaction.
 ===============================================================================
 */
 
@@ -105,7 +77,7 @@ static void die(const char *msg) {
 /* --------------------------------------------------------------------------
    open_uart
    --------------------------------------------------------------------------
-   Open and configure a UART device in raw 115200 8N1 mode.
+   Open and configure a UART device in true raw 115200 8N1 mode.
    -------------------------------------------------------------------------- */
 static int open_uart(const char *dev) {
     int fd = open(dev, O_RDWR | O_NOCTTY | O_SYNC);
@@ -114,24 +86,22 @@ static int open_uart(const char *dev) {
     }
 
     struct termios tio;
-    memset(&tio, 0, sizeof(tio));
-
     if (tcgetattr(fd, &tio) != 0) {
         die("tcgetattr");
     }
 
+    /* Put tty into raw mode to avoid CR/LF translation and other processing */
+    cfmakeraw(&tio);
+
     cfsetispeed(&tio, B115200);
     cfsetospeed(&tio, B115200);
 
-    tio.c_cflag = (tio.c_cflag & ~CSIZE) | CS8;
     tio.c_cflag |= (CLOCAL | CREAD);
-    tio.c_cflag &= ~(PARENB | PARODD);
-    tio.c_cflag &= ~CSTOPB;
     tio.c_cflag &= ~CRTSCTS;
-
-    tio.c_iflag &= ~(IXON | IXOFF | IXANY);
-    tio.c_lflag = 0;
-    tio.c_oflag = 0;
+    tio.c_cflag &= ~CSTOPB;
+    tio.c_cflag &= ~PARENB;
+    tio.c_cflag &= ~CSIZE;
+    tio.c_cflag |= CS8;
 
     tio.c_cc[VMIN]  = 0;
     tio.c_cc[VTIME] = 1;   /* 100 ms */
@@ -274,27 +244,6 @@ typedef struct {
    workload_windowed
    --------------------------------------------------------------------------
    Execute a deterministic workload for 'steps' iterations.
-
-   Timing is measured per fixed-size window:
-     window 0 = steps 0..31
-     window 1 = steps 32..63
-     ...
-
-   Returns:
-     - final checksum
-     - total cycles
-     - worst window index
-     - worst window cycles
-
-   Notes:
-     - This workload deliberately mixes:
-         * arithmetic
-         * rotates/shifts
-         * memory reads/writes
-         * data-dependent addressing
-         * occasional branch-like path variation
-     - The goal is not functional correctness of an application, but a stable,
-       reproducible instruction/memory mix for differential analysis.
    -------------------------------------------------------------------------- */
 static run_result_t workload_windowed(uint32_t seed, int steps) {
     run_result_t rr;
@@ -362,7 +311,7 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
 
     rr.total_cycles = total_end - total_start;
     rr.checksum     = acc;
-    rr.flags        = 0; /* Reserved for future trap/fault encoding */
+    rr.flags        = 0;
 
     return rr;
 }
@@ -387,8 +336,14 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Quick connectivity test: accept LF or CRLF */
+        if (strcmp(line, "PING\n") == 0 || strcmp(line, "PING\r\n") == 0) {
+            write_all(fd, "PONG\n");
+            continue;
+        }
+
         /*
-        Expected command:
+        Expected workload command:
           RUN <seed_hex8> <steps_dec>
         */
         unsigned seed = 0;
@@ -411,10 +366,6 @@ int main(int argc, char **argv) {
         /*
         Score definition:
           score = total_cycles XOR checksum
-
-        This mixes:
-          - architectural output proxy (checksum)
-          - timing behavior (total cycles)
         */
         uint64_t score = rr.total_cycles ^ (uint64_t)rr.checksum;
 
