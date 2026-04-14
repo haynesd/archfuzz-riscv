@@ -12,23 +12,23 @@ Reinforcement Learning Host Controller for FPGA Differential Fuzzing Lab
 
 DESCRIPTION
 -------------------------------------------------------------------------------
-This program implements a host-side reinforcement learning (RL) controller
-for a multi-board differential fuzzing system.
+This program is the Windows host-side controller for the FPGA differential
+fuzzing lab.
 
-The system architecture consists of:
-  - Host PC (this program)
-  - FPGA (UART router + scheduler)
-  - Multiple RISC-V boards running runner.c
+It can be used in three modes:
 
-The host:
-  - Selects test parameters (seed + step count)
-  - Sends jobs to each board via the FPGA
-  - Collects results
-  - Computes a reward based on divergence
-  - Updates an RL policy (UCB multi-armed bandit)
+  1) ping
+     Send a PING command to one board and wait for PONG.
+     Useful for quick end-to-end connectivity testing.
 
-This enables automated discovery of interesting execution divergences
-across heterogeneous or identical RISC-V implementations.
+  2) run1
+     Send one RUN command to one board and print the DONE response.
+     Useful for validating one board before running RL.
+
+  3) rl
+     Run the reinforcement-learning loop across all 3 boards.
+     The host sends the same seed/step count to each board, collects the
+     results, computes a reward, and updates the UCB policy.
 
 ARCHITECTURE
 -------------------------------------------------------------------------------
@@ -51,109 +51,71 @@ PROTOCOL
 Host -> FPGA:
   [0x01][BOARD][ASCII COMMAND]
 
-Example:
-  [0x01][0] "RUN 00112233 256\n"
+Examples:
+  [0x01][0] "PING\n"
+  [0x01][0] "RUN 12345 256\n"
 
-Commands:
-  RUN <seed_hex8> <steps>\n
+FPGA -> Host:
+  PONG\n
+  DONE <seed> <score> <flags> <window> <cycles>\n
+  T\n
 
-FPGA behavior:
-  - Routes command to selected board
-  - Buffers UART traffic (TX + RX)
-  - Returns board response line to host
-  - Returns "T\n" on timeout
-
-Board (runner.c):
-  - Receives ASCII command
-  - Executes deterministic workload
-  - Returns:
-      DONE <seed> <score> <flags> <window> <cycles>\n
-    or:
-      T\n
-
-DATA FORMAT
+SEED EXPLANATION
 -------------------------------------------------------------------------------
-DONE line fields:
-  seed          : test seed (hex)
-  score         : total_cycles XOR checksum
-  flags         : anomaly flags (future use)
-  worst_window  : index of slowest window
-  worst_cycles  : cycle/time cost of that window
+A seed is just a number that controls how the board's deterministic workload
+behaves.
 
-Note:
-  Timing uses clock_gettime() (not rdcycle) for Linux compatibility.
+Same seed:
+  - same generated test pattern
+  - same sequence of operations
 
-REINFORCEMENT LEARNING
--------------------------------------------------------------------------------
-Multi-armed bandit (UCB):
+Different seed:
+  - different test pattern
+  - different memory / arithmetic / timing behavior
 
-Arms:
-  {64, 128, 256, 512, 1024}
+In other words:
+  Seed = one specific reproducible test case
 
-Loop:
-  1. Select arm via UCB
-  2. Choose random seed
-  3. Execute test on all boards
-  4. Collect results
-  5. Compute reward
-  6. Update arm statistics
-
-REWARD FUNCTION
--------------------------------------------------------------------------------
-Reward is based on divergence across boards:
-
-  - Score divergence (primary signal)
-  - Fault flags (large bonus)
-  - Worst-window disagreement
-  - Worst-cycle differences
-
-Goal:
-  Maximize behavioral divergence → discover corner cases,
-  timing anomalies, or hardware inconsistencies.
-
-===============================================================================
 COMPILATION
 -------------------------------------------------------------------------------
-
-Windows (MinGW-w64 / MSYS2 / Git Bash):
-
 Release build:
   gcc -O2 -Wall -Wextra -std=c11 -o rl_host.exe rl_host.c
 
 Debug build:
   gcc -O0 -g -Wall -Wextra -std=c11 -o rl_host_debug.exe rl_host.c
 
-Notes:
-  - Requires Windows headers (windows.h)
-  - No external libraries needed
-  - Works with MinGW-w64 
+No external libraries are required.
 
-===============================================================================
 USAGE
 -------------------------------------------------------------------------------
-  rl_host COM5 0x00000010 0x00010000
+1) Ping one board:
+     rl_host.exe ping <COM_PORT> <BOARD>
 
-Arguments:
-  COMx     : Windows serial port
-  seed_lo  : lower bound of seed range
-  seed_hi  : upper bound of seed range
+   Example:
+     rl_host.exe ping COM5 0
 
-Example:
-  rl_host COM5 0x00000010 0x00010000
+2) Run one test on one board:
+     rl_host.exe run1 <COM_PORT> <BOARD> <SEED> <STEPS>
 
-===============================================================================
-OUTPUT
--------------------------------------------------------------------------------
-Example:
+   Example:
+     rl_host.exe run1 COM5 0 12345 256
 
-  iter=42 seed=00112233 steps=256 reward=12345.67
+3) Run RL loop on all 3 boards:
+     rl_host.exe rl <COM_PORT> <SEED_START> <SEED_END>
 
-===============================================================================
-NOTES
--------------------------------------------------------------------------------
-- Requires FPGA firmware with UART buffering (TX + RX)
-- Requires runner.c running on each board
-- Serial settings: 115200 8N1
+   Example:
+     rl_host.exe rl COM5 16 65536
+
+Board numbers:
+  0 = Board 0
+  1 = Board 1
+  2 = Board 2
+
+Notes:
+  - Use normal decimal numbers
+  - In RL mode, the host randomly picks seeds between SEED_START and SEED_END
+  - Larger seed ranges provide more test variety
+
 ===============================================================================
 */
 
@@ -182,15 +144,38 @@ static void die(const char *msg) {
     exit(1);
 }
 
+static void print_usage_and_exit(void) {
+    die(
+        "Usage:\n"
+        "  rl_host.exe ping <COM_PORT> <BOARD>\n"
+        "  rl_host.exe run1 <COM_PORT> <BOARD> <SEED> <STEPS>\n"
+        "  rl_host.exe rl   <COM_PORT> <SEED_START> <SEED_END>\n\n"
+        "Examples:\n"
+        "  rl_host.exe ping COM5 0\n"
+        "  rl_host.exe run1 COM5 0 12345 256\n"
+        "  rl_host.exe rl COM5 16 65536\n"
+    );
+}
+
 static com_t com_open(const char *port) {
     char path[64];
     snprintf(path, sizeof(path), "\\\\.\\%s", port);
 
-    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE h = CreateFileA(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
+
     if (h == INVALID_HANDLE_VALUE) die("COM open failed");
 
     DCB dcb = {0};
     dcb.DCBlength = sizeof(dcb);
+
     if (!GetCommState(h, &dcb)) die("GetCommState failed");
 
     dcb.BaudRate = CBR_115200;
@@ -201,7 +186,7 @@ static com_t com_open(const char *port) {
     dcb.fParity  = FALSE;
     dcb.fOutxCtsFlow = FALSE;
     dcb.fOutxDsrFlow = FALSE;
-    dcb.fDtrControl  = DTR_CONTROL_DISABLE;
+    dcb.fDtrControl = DTR_CONTROL_DISABLE;
     dcb.fDsrSensitivity = FALSE;
     dcb.fTXContinueOnXoff = TRUE;
     dcb.fOutX = FALSE;
@@ -210,7 +195,6 @@ static com_t com_open(const char *port) {
 
     if (!SetCommState(h, &dcb)) die("SetCommState failed");
 
-    // Important: avoid blocking forever
     COMMTIMEOUTS t = {0};
     t.ReadIntervalTimeout         = 50;
     t.ReadTotalTimeoutConstant    = 200;
@@ -232,12 +216,12 @@ static void dump_bytes_hex(const uint8_t *buf, int len) {
     printf("\n");
 }
 
-static void send_to_board(com_t *c, int board, uint32_t seed, int steps) {
-    char payload[128];
-    snprintf(payload, sizeof(payload), "RUN %08X %d\n", seed, steps);
-
+static void write_frame(com_t *c, int board, const char *payload) {
     uint8_t frame[256];
     int len = (int)strlen(payload);
+
+    if (board < 0 || board > 2) die("Board must be 0, 1, or 2");
+    if (len + 2 > (int)sizeof(frame)) die("Payload too large");
 
     frame[0] = 0x01;
     frame[1] = (uint8_t)board;
@@ -253,6 +237,16 @@ static void send_to_board(com_t *c, int board, uint32_t seed, int steps) {
     printf("[HOST TX ASCII][board %d] %s", board, payload);
 }
 
+static void send_ping(com_t *c, int board) {
+    write_frame(c, board, "PING\n");
+}
+
+static void send_run(com_t *c, int board, uint32_t seed, int steps) {
+    char payload[128];
+    snprintf(payload, sizeof(payload), "RUN %u %d\n", seed, steps);
+    write_frame(c, board, payload);
+}
+
 static int readline(com_t *c, char *buf, int max) {
     int i = 0;
 
@@ -265,14 +259,11 @@ static int readline(com_t *c, char *buf, int max) {
         }
 
         if (n == 0) {
-            // timeout slice
             continue;
         }
 
         buf[i++] = ch;
-        if (ch == '\n') {
-            break;
-        }
+        if (ch == '\n') break;
     }
 
     buf[i] = 0;
@@ -300,9 +291,11 @@ static bool parse_done(const char *line, int idx, triple_t *triple) {
     unsigned seed = 0, flags = 0, worst_window = 0;
     unsigned long long score = 0, worst_cycles = 0;
 
-    int rc = sscanf(line,
-        "DONE %x %llu %x %u %llu",
-        &seed, &score, &flags, &worst_window, &worst_cycles);
+    int rc = sscanf(
+        line,
+        "DONE %u %llu %u %u %llu",
+        &seed, &score, &flags, &worst_window, &worst_cycles
+    );
 
     if (rc != 5) {
         return false;
@@ -314,7 +307,6 @@ static bool parse_done(const char *line, int idx, triple_t *triple) {
     triple->worst_window[idx] = worst_window;
     triple->worst_cycles[idx] = (uint64_t)worst_cycles;
     triple->done[idx] = true;
-
     triple->ok = triple->done[0] && triple->done[1] && triple->done[2];
     return true;
 }
@@ -389,23 +381,96 @@ static void update_arm(arm_t *a, double r) {
 }
 
 //=============================================================================
-// MAIN
+// HELPERS
 //=============================================================================
 
-int main(int argc, char **argv) {
-    if (argc < 4) {
-        die("Usage: rl_host COMx seed_lo seed_hi\n"
-            "Example: rl_host COM5 0x00000010 0x00010000");
+static int parse_board(const char *s) {
+    int b = atoi(s);
+    if (b < 0 || b > 2) die("Board must be 0, 1, or 2");
+    return b;
+}
+
+static uint32_t parse_u32_decimal(const char *s, const char *what) {
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s || *end != '\0') {
+        fprintf(stderr, "Invalid %s: %s\n", what, s);
+        exit(1);
     }
+    return (uint32_t)v;
+}
 
-    uint32_t lo = (uint32_t)strtoul(argv[2], 0, 0);
-    uint32_t hi = (uint32_t)strtoul(argv[3], 0, 0);
-
-    if (hi < lo) {
-        die("seed_hi must be >= seed_lo");
+static int parse_int_decimal(const char *s, const char *what) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0') {
+        fprintf(stderr, "Invalid %s: %s\n", what, s);
+        exit(1);
     }
+    return (int)v;
+}
 
-    com_t c = com_open(argv[1]);
+static bool read_one_response(com_t *c, char *line, int line_sz) {
+    int n = readline(c, line, line_sz);
+    if (n < 0) die("ReadFile failed");
+    if (n == 0) return false;
+    return true;
+}
+
+//=============================================================================
+// MODES
+//=============================================================================
+
+static int mode_ping(const char *com_port, int board) {
+    com_t c = com_open(com_port);
+    char line[512];
+
+    send_ping(&c, board);
+
+    while (true) {
+        if (!read_one_response(&c, line, (int)sizeof(line))) continue;
+
+        printf("[HOST RX][board %d] %s", board, line);
+
+        if (strncmp(line, "PONG", 4) == 0) {
+            printf("[OK] Received PONG from board %d\n", board);
+            return 0;
+        }
+
+        if (strcmp(line, "T\n") == 0 || strcmp(line, "T\r\n") == 0) {
+            printf("[FAIL] Timeout waiting for board %d\n", board);
+            return 1;
+        }
+    }
+}
+
+static int mode_run1(const char *com_port, int board, uint32_t seed, int steps) {
+    com_t c = com_open(com_port);
+    char line[512];
+
+    send_run(&c, board, seed, steps);
+
+    while (true) {
+        if (!read_one_response(&c, line, (int)sizeof(line))) continue;
+
+        printf("[HOST RX][board %d] %s", board, line);
+
+        if (strncmp(line, "DONE", 4) == 0) {
+            printf("[OK] Single run completed on board %d\n", board);
+            return 0;
+        }
+
+        if (strcmp(line, "T\n") == 0 || strcmp(line, "T\r\n") == 0) {
+            printf("[FAIL] Timeout waiting for board %d\n", board);
+            return 1;
+        }
+    }
+}
+
+static int mode_rl(const char *com_port, uint32_t lo, uint32_t hi) {
+    if (hi < lo) die("SEED_END must be >= SEED_START");
+
+    com_t c = com_open(com_port);
 
     arm_t arms[] = {
         {64,0,0},{128,0,0},{256,0,0},{512,0,0},{1024,0,0}
@@ -430,13 +495,10 @@ int main(int argc, char **argv) {
         bool any_parse_error = false;
 
         for (int b = 0; b < 3; b++) {
-            send_to_board(&c, b, seed, steps);
+            send_run(&c, b, seed, steps);
 
             while (true) {
-                int n = readline(&c, line, (int)sizeof(line));
-                if (n < 0) {
-                    die("ReadFile failed");
-                }
+                if (!read_one_response(&c, line, (int)sizeof(line))) continue;
 
                 printf("[HOST RX][board %d] %s", b, line);
 
@@ -457,7 +519,7 @@ int main(int argc, char **argv) {
         }
 
         if (any_timeout || any_parse_error || !tr.ok) {
-            printf("iter=%" PRIu64 " seed=%08X steps=%d skipped\n",
+            printf("iter=%" PRIu64 " seed=%u steps=%d skipped\n",
                    iter++, seed, steps);
             continue;
         }
@@ -465,7 +527,49 @@ int main(int argc, char **argv) {
         double r = digital_divergence(&tr);
         update_arm(&arms[ai], r);
 
-        printf("iter=%" PRIu64 " seed=%08X steps=%d reward=%.2f\n",
+        printf("iter=%" PRIu64 " seed=%u steps=%d reward=%.2f\n",
                iter++, seed, steps, r);
     }
+}
+
+//=============================================================================
+// MAIN
+//=============================================================================
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        print_usage_and_exit();
+    }
+
+    if (strcmp(argv[1], "ping") == 0) {
+        if (argc != 4) print_usage_and_exit();
+
+        const char *com_port = argv[2];
+        int board = parse_board(argv[3]);
+        return mode_ping(com_port, board);
+    }
+
+    if (strcmp(argv[1], "run1") == 0) {
+        if (argc != 6) print_usage_and_exit();
+
+        const char *com_port = argv[2];
+        int board = parse_board(argv[3]);
+        uint32_t seed = parse_u32_decimal(argv[4], "SEED");
+        int steps = parse_int_decimal(argv[5], "STEPS");
+
+        return mode_run1(com_port, board, seed, steps);
+    }
+
+    if (strcmp(argv[1], "rl") == 0) {
+        if (argc != 5) print_usage_and_exit();
+
+        const char *com_port = argv[2];
+        uint32_t lo = parse_u32_decimal(argv[3], "SEED_START");
+        uint32_t hi = parse_u32_decimal(argv[4], "SEED_END");
+
+        return mode_rl(com_port, lo, hi);
+    }
+
+    print_usage_and_exit();
+    return 0;
 }
