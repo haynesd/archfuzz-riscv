@@ -21,22 +21,6 @@ Supported commands:
   2) RUN
        Input : RUN <seed_hex8> <steps_dec>\n
        Output: DONE <seed_hex8> <score_dec> <flags_hex8> <worst_window_dec> <worst_cycles_dec>\n
-
-This allows:
-  - a quick end-to-end connectivity test with PING/PONG
-  - the full deterministic workload execution with RUN
-
-BUILD
--------------------------------------------------------------------------------
-On each Linux board:
-  gcc -O2 -Wall -Wextra -o runner runner_windowed.c
-
-RUN
--------------------------------------------------------------------------------
-  ./runner /dev/ttyS1
-
-Replace /dev/ttyS1 with the UART device connected to the FPGA.
-===============================================================================
 */
 
 #define _GNU_SOURCE
@@ -56,29 +40,40 @@ Replace /dev/ttyS1 with the UART device connected to the FPGA.
    Workload Configuration
    ========================================================================== */
 
-#define MEM_WORDS   (64 * 1024)   /* 256 KB scratch region */
-#define WINDOW_SIZE 32            /* steps per timing window */
-#define MAX_WINDOWS 1024          /* hard cap on windows */
+#define MEM_WORDS   (64 * 1024)
+#define WINDOW_SIZE 32
+#define MAX_WINDOWS 1024
 
 /* ============================================================================
    UART Helpers
    ========================================================================== */
 
-/* --------------------------------------------------------------------------
-   die
-   --------------------------------------------------------------------------
-   Print perror and terminate.
-   -------------------------------------------------------------------------- */
 static void die(const char *msg) {
     perror(msg);
     exit(1);
 }
 
-/* --------------------------------------------------------------------------
-   open_uart
-   --------------------------------------------------------------------------
-   Open and configure a UART device in true raw 115200 8N1 mode.
-   -------------------------------------------------------------------------- */
+static void print_visible_line(const char *tag, const char *s) {
+    fputs(tag, stdout);
+
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (c == '\n') {
+            fputs("\\n", stdout);
+        } else if (c == '\r') {
+            fputs("\\r", stdout);
+        } else if (c >= 32 && c <= 126) {
+            fputc((int)c, stdout);
+        } else {
+            fprintf(stdout, "\\x%02X", c);
+        }
+    }
+
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
 static int open_uart(const char *dev) {
     int fd = open(dev, O_RDWR | O_NOCTTY | O_SYNC);
     if (fd < 0) {
@@ -90,7 +85,6 @@ static int open_uart(const char *dev) {
         die("tcgetattr");
     }
 
-    /* Put tty into raw mode to avoid CR/LF translation and other processing */
     cfmakeraw(&tio);
 
     cfsetispeed(&tio, B115200);
@@ -104,7 +98,7 @@ static int open_uart(const char *dev) {
     tio.c_cflag |= CS8;
 
     tio.c_cc[VMIN]  = 0;
-    tio.c_cc[VTIME] = 1;   /* 100 ms */
+    tio.c_cc[VTIME] = 1;
 
     if (tcsetattr(fd, TCSANOW, &tio) != 0) {
         die("tcsetattr");
@@ -114,14 +108,6 @@ static int open_uart(const char *dev) {
     return fd;
 }
 
-/* --------------------------------------------------------------------------
-   readline_uart
-   --------------------------------------------------------------------------
-   Read one line from UART.
-   Returns:
-     0  -> timeout slice / no full line yet
-     >0 -> bytes read
-   -------------------------------------------------------------------------- */
 static int readline_uart(int fd, char *out, size_t max) {
     size_t n = 0;
 
@@ -149,17 +135,14 @@ static int readline_uart(int fd, char *out, size_t max) {
         }
     }
 
-    out[n] = 0;
+    out[n] = '\0';
     return (int)n;
 }
 
-/* --------------------------------------------------------------------------
-   write_all
-   --------------------------------------------------------------------------
-   Write the full string to UART.
-   -------------------------------------------------------------------------- */
 static void write_all(int fd, const char *s) {
     size_t len = strlen(s);
+
+    print_visible_line("[TX] ", s);
 
     while (len) {
         ssize_t n = write(fd, s, len);
@@ -180,36 +163,12 @@ static void write_all(int fd, const char *s) {
    Timing Source
    ========================================================================== */
 
-/* --------------------------------------------------------------------------
-   rdcycle_u64
-   --------------------------------------------------------------------------
-   Read the RISC-V cycle counter as a 64-bit value.
-
-   RV64:
-     rdcycle directly
-
-   RV32:
-     combine rdcycleh / rdcycle / rdcycleh until stable
-   -------------------------------------------------------------------------- */
 static inline uint64_t rdcycle_u64(void) {
-#if defined(__riscv) && (__riscv_xlen == 64)
-    uint64_t x;
-    asm volatile ("rdcycle %0" : "=r"(x));
-    return x;
-#elif defined(__riscv)
-    uint32_t hi0, lo, hi1;
-    do {
-        asm volatile ("rdcycleh %0" : "=r"(hi0));
-        asm volatile ("rdcycle %0"  : "=r"(lo));
-        asm volatile ("rdcycleh %0" : "=r"(hi1));
-    } while (hi0 != hi1);
-    return ((uint64_t)hi0 << 32) | lo;
-#else
-    /* Non-RISC-V fallback for development only */
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        die("clock_gettime");
+    }
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-#endif
 }
 
 /* ============================================================================
@@ -218,11 +177,6 @@ static inline uint64_t rdcycle_u64(void) {
 
 static uint32_t mem[MEM_WORDS];
 
-/* --------------------------------------------------------------------------
-   xorshift32
-   --------------------------------------------------------------------------
-   Deterministic pseudorandom generator.
-   -------------------------------------------------------------------------- */
 static inline uint32_t xorshift32(uint32_t *s) {
     uint32_t x = *s;
     x ^= x << 13;
@@ -240,11 +194,6 @@ typedef struct {
     uint64_t worst_cycles;
 } run_result_t;
 
-/* --------------------------------------------------------------------------
-   workload_windowed
-   --------------------------------------------------------------------------
-   Execute a deterministic workload for 'steps' iterations.
-   -------------------------------------------------------------------------- */
 static run_result_t workload_windowed(uint32_t seed, int steps) {
     run_result_t rr;
     memset(&rr, 0, sizeof(rr));
@@ -257,7 +206,6 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
         n_windows = MAX_WINDOWS;
     }
 
-    /* Small deterministic warm-up initialization */
     for (int i = 0; i < 1024; i++) {
         uint32_t r = xorshift32(&st);
         mem[r % MEM_WORDS] ^= (r + (uint32_t)i);
@@ -277,22 +225,18 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
         for (int i = step_begin; i < step_end; i++) {
             uint32_t r = xorshift32(&st);
 
-            /* ALU-heavy section */
             acc ^= (r * 2654435761u);
             acc += (acc << 7) ^ (r >> 3);
             acc = (acc << 3) | (acc >> 29);
 
-            /* Memory section */
             uint32_t idx = (r ^ acc) % MEM_WORDS;
             uint32_t v   = mem[idx];
             v ^= (acc + r);
             v += (v << 11) ^ (v >> 9);
             mem[idx] = v;
 
-            /* Dependent access to amplify microarchitectural sensitivity */
             acc ^= mem[(idx + (acc & 1023)) % MEM_WORDS];
 
-            /* Occasional branch-ish perturbation */
             if ((r & 0x3FF) == 0x155) {
                 acc ^= 0xDEADBEEFu;
             }
@@ -330,26 +274,28 @@ int main(int argc, char **argv) {
     int fd = open_uart(argv[1]);
     char line[256];
 
+    printf("[INFO] runner started on %s\n", argv[1]);
+    fflush(stdout);
+
     for (;;) {
         int n = readline_uart(fd, line, sizeof(line));
         if (n == 0) {
             continue;
         }
 
-        /* Quick connectivity test: accept LF or CRLF */
+        print_visible_line("[RX] ", line);
+
         if (strcmp(line, "PING\n") == 0 || strcmp(line, "PING\r\n") == 0) {
             write_all(fd, "PONG\n");
             continue;
         }
 
-        /*
-        Expected workload command:
-          RUN <seed_hex8> <steps_dec>
-        */
         unsigned seed = 0;
         int steps = 0;
 
         if (sscanf(line, "RUN %x %d", &seed, &steps) != 2) {
+            printf("[INFO] ignored unrecognized command\n");
+            fflush(stdout);
             continue;
         }
 
@@ -361,12 +307,12 @@ int main(int argc, char **argv) {
             steps = WINDOW_SIZE * MAX_WINDOWS;
         }
 
+        printf("[INFO] running workload seed=%08X steps=%d\n",
+               (uint32_t)seed, steps);
+        fflush(stdout);
+
         run_result_t rr = workload_windowed((uint32_t)seed, steps);
 
-        /*
-        Score definition:
-          score = total_cycles XOR checksum
-        */
         uint64_t score = rr.total_cycles ^ (uint64_t)rr.checksum;
 
         char out[256];
