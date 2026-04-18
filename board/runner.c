@@ -512,7 +512,7 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
 
     int n_windows = (steps + WINDOW_SIZE - 1) / WINDOW_SIZE; /* Compute how many fixed-size timing windows are needed to cover the requested step count, rounding up for partial final windows. */
     if (n_windows > MAX_WINDOWS) {                   /* Guard against excessive window counts so the workload stays inside the designed analysis limits. */
-        n_windows = MAX_WINDOWS;                     /* Clamp the number of windows to the maximum supported value. */
+        n_windows = MAX_WINDOWS;                     /* Limit the number of windows to the maximum supported value. */
     }
 
     for (int i = 0; i < 1024; i++) {                 /* Run a deterministic warm-up loop to initialize scratch memory into a seed-dependent state before timing the main workload. */
@@ -594,7 +594,7 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
 
     rr.total_cycles = total_end - total_start;        /* Save the total run time so the host can compare overall timing behavior across boards. */
     rr.checksum     = acc;                            /* Save the final accumulator as the deterministic data-path summary for this seed/run. */
-    rr.flags        = 0;                              /* Leave flags clear for now; this field is reserved for future anomaly or fault markers. */
+    rr.flags        = 0;                              /* Leave flags clear for now; TBD */
 
     return rr;                                        /* Return the completed result structure to the caller so it can be formatted into the DONE line. */
 }
