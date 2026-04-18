@@ -29,13 +29,6 @@ typedef struct {
 #define RIGOL_SOCK_ERR INVALID_SOCKET
 #define RIGOL_MAX_LINE 4096
 
-/*
--------------------------------------------------------------------------------
-rigol_die_wsa
--------------------------------------------------------------------------------
-Logs a Winsock-specific fatal error and terminates the process.
--------------------------------------------------------------------------------
-*/
 static void rigol_die_wsa(const char *msg) {
     rl_log_message(RL_LOG_ERROR, "%s (WSA=%d)", msg, WSAGetLastError());
     rl_log_close();
@@ -55,13 +48,6 @@ void rigol_net_cleanup(void) {
     rl_log_message(RL_LOG_INFO, "Rigol network stack cleaned up");
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_tcp_connect
--------------------------------------------------------------------------------
-Creates a TCP connection to the configured scope endpoint.
--------------------------------------------------------------------------------
-*/
 static rigol_socket_t rigol_tcp_connect(const char *host, const char *port) {
     struct addrinfo hints, *results = NULL, *rp = NULL;
     rigol_socket_t sock = RIGOL_SOCK_ERR;
@@ -89,21 +75,14 @@ static rigol_socket_t rigol_tcp_connect(const char *host, const char *port) {
     }
 
     freeaddrinfo(results);
+
     if (sock == RIGOL_SOCK_ERR) {
         rigol_die_wsa("scope connect failed");
     }
 
-    rl_log_message(RL_LOG_INFO, "Connected to Rigol scope %s:%s", host, port);
     return sock;
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_send_all
--------------------------------------------------------------------------------
-Sends the entire buffer over the socket.
--------------------------------------------------------------------------------
-*/
 static void rigol_send_all(rigol_socket_t sock, const void *buffer, size_t length) {
     const char *p = (const char *)buffer;
     while (length > 0) {
@@ -116,26 +95,12 @@ static void rigol_send_all(rigol_socket_t sock, const void *buffer, size_t lengt
     }
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_scpi_write
--------------------------------------------------------------------------------
-Writes one SCPI command terminated by a newline.
--------------------------------------------------------------------------------
-*/
 static void rigol_scpi_write(rigol_socket_t sock, const char *cmd) {
     rigol_send_all(sock, cmd, strlen(cmd));
     rigol_send_all(sock, "\n", 1);
     rl_log_message(RL_LOG_DEBUG, "[SCPI TX] %s", cmd);
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_recv_one
--------------------------------------------------------------------------------
-Reads one byte from the socket.
--------------------------------------------------------------------------------
-*/
 static int rigol_recv_one(rigol_socket_t sock, char *ch) {
     int rc = recv(sock, ch, 1, 0);
     if (rc < 0) {
@@ -144,13 +109,6 @@ static int rigol_recv_one(rigol_socket_t sock, char *ch) {
     return rc;
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_scpi_readline
--------------------------------------------------------------------------------
-Reads a newline-terminated SCPI response line.
--------------------------------------------------------------------------------
-*/
 static int rigol_scpi_readline(rigol_socket_t sock, char *out, size_t max_len) {
     size_t count = 0;
     while (count + 1 < max_len) {
@@ -168,13 +126,6 @@ static int rigol_scpi_readline(rigol_socket_t sock, char *out, size_t max_len) {
     return (int)count;
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_trim_eol
--------------------------------------------------------------------------------
-Removes trailing CR/LF characters from a response string.
--------------------------------------------------------------------------------
-*/
 static void rigol_trim_eol(char *text) {
     size_t n = strlen(text);
     while (n > 0 && (text[n - 1] == '\n' || text[n - 1] == '\r')) {
@@ -182,13 +133,6 @@ static void rigol_trim_eol(char *text) {
     }
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_scpi_query
--------------------------------------------------------------------------------
-Sends one SCPI query and receives its single-line response.
--------------------------------------------------------------------------------
-*/
 static void rigol_scpi_query(rigol_socket_t sock, const char *cmd, char *out, size_t max_len) {
     rigol_scpi_write(sock, cmd);
     if (rigol_scpi_readline(sock, out, max_len) <= 0) {
@@ -198,13 +142,6 @@ static void rigol_scpi_query(rigol_socket_t sock, const char *cmd, char *out, si
     rl_log_message(RL_LOG_DEBUG, "[SCPI RX] %s", out);
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_read_exact
--------------------------------------------------------------------------------
-Reads an exact byte count from the scope transport.
--------------------------------------------------------------------------------
-*/
 static int rigol_read_exact(rigol_socket_t sock, void *buffer, size_t length) {
     char *p = (char *)buffer;
     size_t received = 0;
@@ -221,66 +158,53 @@ static int rigol_read_exact(rigol_socket_t sock, void *buffer, size_t length) {
     return 1;
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_read_binblock
--------------------------------------------------------------------------------
-Reads an IEEE 488.2 definite-length binary block containing waveform samples.
--------------------------------------------------------------------------------
-*/
-static uint8_t *rigol_read_binblock(rigol_socket_t sock, size_t *payload_len_out) {
-    char hash;
+static uint8_t *rigol_read_binblock(rigol_socket_t sock, size_t *out_length) {
+    char hash = 0;
     if (!rigol_read_exact(sock, &hash, 1) || hash != '#') {
         die("expected binary block header '#'");
     }
 
-    char ndig_ch;
-    if (!rigol_read_exact(sock, &ndig_ch, 1)) {
+    char digits_char = 0;
+    if (!rigol_read_exact(sock, &digits_char, 1)) {
         die("failed to read binary block digit count");
     }
-    if (ndig_ch < '0' || ndig_ch > '9') {
+
+    if (digits_char < '0' || digits_char > '9') {
         die("invalid binary block digit count");
     }
 
-    int ndig = ndig_ch - '0';
-    if (ndig <= 0 || ndig > 9) {
+    const int digits = digits_char - '0';
+    if (digits <= 0 || digits > 9) {
         die("unsupported binary block digit count");
     }
 
-    char lenbuf[16];
-    memset(lenbuf, 0, sizeof(lenbuf));
-    if (!rigol_read_exact(sock, lenbuf, (size_t)ndig)) {
-        die("failed to read binary block length");
+    char length_buffer[16];
+    memset(length_buffer, 0, sizeof(length_buffer));
+    if (!rigol_read_exact(sock, length_buffer, (size_t)digits)) {
+        die("failed to read binary block payload length");
     }
 
-    size_t payload_len = (size_t)strtoull(lenbuf, NULL, 10);
-    uint8_t *payload = (uint8_t *)malloc(payload_len);
-    if (!payload) {
-        die("malloc failed for waveform buffer");
+    size_t payload_length = (size_t)strtoull(length_buffer, NULL, 10);
+    uint8_t *data = (uint8_t *)malloc(payload_length);
+    if (!data) {
+        die("malloc failed for waveform payload");
     }
 
-    if (!rigol_read_exact(sock, payload, payload_len)) {
-        free(payload);
+    if (!rigol_read_exact(sock, data, payload_length)) {
+        free(data);
         die("failed to read binary block payload");
     }
 
-    char maybe_nl;
-    int peeked = recv(sock, &maybe_nl, 1, MSG_PEEK);
-    if (peeked == 1 && (maybe_nl == '\n' || maybe_nl == '\r')) {
-        rigol_recv_one(sock, &maybe_nl);
+    char maybe_newline = 0;
+    int peeked = recv(sock, &maybe_newline, 1, MSG_PEEK);
+    if (peeked == 1 && (maybe_newline == '\n' || maybe_newline == '\r')) {
+        (void)rigol_recv_one(sock, &maybe_newline);
     }
 
-    *payload_len_out = payload_len;
-    return payload;
+    *out_length = payload_length;
+    return data;
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_parse_preamble
--------------------------------------------------------------------------------
-Parses the waveform preamble returned by the scope.
--------------------------------------------------------------------------------
-*/
 static rigol_preamble_t rigol_parse_preamble(const char *text) {
     rigol_preamble_t preamble;
     memset(&preamble, 0, sizeof(preamble));
@@ -300,77 +224,100 @@ static rigol_preamble_t rigol_parse_preamble(const char *text) {
     if (matched != 10) {
         die("failed to parse waveform preamble");
     }
+
     return preamble;
 }
 
-/*
--------------------------------------------------------------------------------
-rigol_sample_to_volts
--------------------------------------------------------------------------------
-Converts one raw scope sample into volts using the preamble scaling.
--------------------------------------------------------------------------------
-*/
 static double rigol_sample_to_volts(uint8_t raw, const rigol_preamble_t *preamble) {
     return (((double)raw) - (double)preamble->yref - preamble->yorig) * preamble->yincr;
 }
 
-waveform_t rigol_capture_waveform(const rigol_config_t *config) {
-    waveform_t waveform;
-    memset(&waveform, 0, sizeof(waveform));
-
-    if (!config || !config->enabled) {
-        return waveform;
-    }
-
-    rigol_socket_t sock = rigol_tcp_connect(config->scope_ip, config->scope_port);
+static waveform_t rigol_capture_channel_on_socket(rigol_socket_t sock, const char *channel) {
     char line[RIGOL_MAX_LINE];
     char cmd[128];
 
-    rigol_scpi_query(sock, "*IDN?", line, sizeof(line));
-    rl_log_message(RL_LOG_INFO, "[SCOPE] IDN: %s", line);
+    waveform_t wave;
+    memset(&wave, 0, sizeof(wave));
 
-    rigol_scpi_write(sock, ":STOP");
-    snprintf(cmd, sizeof(cmd), ":WAV:SOUR %s", config->channel);
+    snprintf(cmd, sizeof(cmd), ":WAV:SOUR %s", channel);
     rigol_scpi_write(sock, cmd);
     rigol_scpi_write(sock, ":WAV:MODE RAW");
     rigol_scpi_write(sock, ":WAV:FORM BYTE");
-    rigol_scpi_write(sock, ":TRIG:MODE EDGE");
-    rigol_scpi_write(sock, ":TRIG:EDGE:SOUR CHAN2");
-    rigol_scpi_write(sock, ":TRIG:EDGE:SLOP POS");
-
     rigol_scpi_query(sock, ":WAV:PRE?", line, sizeof(line));
+
     rigol_preamble_t preamble = rigol_parse_preamble(line);
 
     rigol_scpi_write(sock, ":WAV:DATA?");
-    size_t raw_len = 0;
-    uint8_t *raw = rigol_read_binblock(sock, &raw_len);
+    size_t raw_length = 0;
+    uint8_t *raw = rigol_read_binblock(sock, &raw_length);
 
-    waveform.time_s = (double *)malloc(raw_len * sizeof(double));
-    waveform.volts = (double *)malloc(raw_len * sizeof(double));
-    if (!waveform.time_s || !waveform.volts) {
+    wave.time_s = (double *)malloc(raw_length * sizeof(double));
+    wave.volts = (double *)malloc(raw_length * sizeof(double));
+    if (!wave.time_s || !wave.volts) {
         free(raw);
-        die("malloc failed for converted waveform");
+        waveform_free(&wave);
+        die("malloc failed for waveform buffers");
     }
 
-    waveform.sample_count = raw_len;
-    waveform.dt_s = preamble.xincr;
-
-    for (size_t i = 0; i < raw_len; ++i) {
-        waveform.time_s[i] = preamble.xorig + ((double)i - (double)preamble.xref) * preamble.xincr;
-        waveform.volts[i] = rigol_sample_to_volts(raw[i], &preamble);
+    for (size_t i = 0; i < raw_length; ++i) {
+        wave.time_s[i] = preamble.xorig + ((double)i - (double)preamble.xref) * preamble.xincr;
+        wave.volts[i] = rigol_sample_to_volts(raw[i], &preamble);
     }
 
-    waveform.metrics = waveform_compute_metrics(waveform.volts, waveform.sample_count, waveform.dt_s);
-    rl_log_message(RL_LOG_INFO,
-                   "Captured waveform: samples=%zu dt=%.12e energy=%.12e area=%.12e rms=%.12e peak=%.12e",
-                   waveform.sample_count,
-                   waveform.dt_s,
-                   waveform.metrics.energy_proxy,
-                   waveform.metrics.abs_area,
-                   waveform.metrics.rms,
-                   waveform.metrics.peak_abs);
+    wave.sample_count = raw_length;
+    wave.dt_s = preamble.xincr;
+    wave.metrics = waveform_compute_metrics(wave.volts, wave.sample_count, wave.dt_s);
 
     free(raw);
+    rl_log_message(RL_LOG_INFO,
+                   "Captured %s: samples=%zu dt=%.12e energy=%.12e",
+                   channel,
+                   wave.sample_count,
+                   wave.dt_s,
+                   wave.metrics.energy_proxy);
+    return wave;
+}
+
+void rigol_arm_single_capture(const rigol_config_t *config) {
+    if (!config || !config->enabled) {
+        return;
+    }
+
+    rigol_socket_t sock = rigol_tcp_connect(config->scope_ip, config->scope_port);
+    char idn[RIGOL_MAX_LINE];
+
+    rigol_scpi_query(sock, "*IDN?", idn, sizeof(idn));
+    rl_log_message(RL_LOG_INFO, "Rigol IDN: %s", idn);
+
+    rigol_scpi_write(sock, ":RUN");
+    rigol_scpi_write(sock, ":SING");
     RIGOL_CLOSESOCK(sock);
-    return waveform;
+
+    rl_log_message(RL_LOG_INFO, "Rigol scope armed for single-shot acquisition");
+}
+
+waveform_capture_set_t rigol_capture_scope_set(const rigol_config_t *config) {
+    waveform_capture_set_t capture;
+    memset(&capture, 0, sizeof(capture));
+
+    if (!config || !config->enabled) {
+        return capture;
+    }
+
+    rigol_socket_t sock = rigol_tcp_connect(config->scope_ip, config->scope_port);
+    char idn[RIGOL_MAX_LINE];
+
+    rigol_scpi_query(sock, "*IDN?", idn, sizeof(idn));
+    rl_log_message(RL_LOG_INFO, "Rigol IDN: %s", idn);
+
+    rigol_scpi_write(sock, ":STOP");
+
+    for (int i = 0; i < RL_BOARD_COUNT; ++i) {
+        capture.power[i] = rigol_capture_channel_on_socket(sock, config->power_channels[i]);
+    }
+    capture.trigger = rigol_capture_channel_on_socket(sock, config->trigger_channel);
+    capture.valid = capture.trigger.metrics.valid;
+
+    RIGOL_CLOSESOCK(sock);
+    return capture;
 }
