@@ -1,0 +1,13 @@
+Build command (MinGW-w64 / Windows):
+
+gcc -O2 -Wall -Wextra -std=c11 \
+  -o rl_host.exe \
+  main.c serial.c rigol.c waveform.c rl.c logging.c \
+  -lws2_32 -lm
+
+Examples:
+  rl_host.exe ping COM5 0
+  rl_host.exe run1 COM5 0 12345 256
+  rl_host.exe rl COM5 16 65536
+  rl_host.exe rl_scope COM5 16 65536 192.168.1.55 5555 CHAN1
+  rl_host.exe --debug --log host.log rl_scope COM5 16 65536 192.168.1.55 5555 CHAN1
