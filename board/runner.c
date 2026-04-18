@@ -31,6 +31,67 @@ The RUN command executes a deterministic synthetic workload driven by the seed.
 The workload is divided into fixed-size windows so timing hotspots can be
 localized.
 
+STEPS (steps_dec)
+-------------------------------------------------------------------------------
+The 'steps' parameter defines how many iterations of the workload will be 
+executed for a given seed. 
+
+The workload is divided into fixed-size windows so timing issues can be
+localized.
+
+Each step represents one full pass through the workload loop, which includes:
+  - ALU operations (integer math, shifts, mixing)
+  - Memory accesses (loads, stores, data-dependent indexing)
+  - Atomic operations (RISC-V AMO instructions)
+  - Control-flow variation (branch-like behavior)
+
+Steps control the *duration and depth* of a test case.
+
+In the differential fuzzing system:
+  - The same (seed, steps) pair is executed on multiple boards.
+  - Results are compared to detect architectural differences.
+  - Increasing steps increases the opportunity for divergence.
+
+STEPS - SO WHAT?
+-------------------------------------------------------------------------------
+Small step counts:
+  - Faster execution
+  - Good for quick scanning of many seeds
+  - Lower chance of exposing subtle timing or state differences
+
+Large step counts:
+  - Longer execution time
+  - More stress on memory, pipelines, and atomic units
+  - Higher chance of exposing:
+      - timing differences
+      - cache/memory effects
+      - ordering/atomic behavior differences
+      - rare control-flow interactions
+
+STEPS - WINDOWING RELATIONSHIP
+-------------------------------------------------------------------------------
+The workload is divided into fixed-size windows (WINDOW_SIZE).
+
+steps determines:
+  total_windows = ceil(steps / WINDOW_SIZE)
+
+Each window is timed independently to identify the "worst" region of execution.
+This allows the system to detect not just total slowdown, but *where* it occurs.
+
+HOW TO USE STEPS
+-------------------------------------------------------------------------------
+Typical usage patterns:
+
+  Exploration phase:
+    - Use smaller step counts (e.g., 64–512)
+    - Scan large ranges of seeds quickly
+
+  Deep analysis phase:
+    - Use larger step counts (e.g., 1024–10000+)
+    - Focus on seeds that already show divergence
+
+
+
 SEED 
 -------------------------------------------------------------------------------
 A seed random number that controls how the test behaves.
@@ -276,8 +337,6 @@ static inline uint64_t monotonic_ticks_u64(void) {
 //   RISC-V AMO Helpers
 //============================================================================ 
 
-#if defined(__riscv)
-
 /* Arithmetic atomic update */
 static inline uint32_t amoadd_w(volatile uint32_t *p, uint32_t val) {
     uint32_t old;
@@ -382,39 +441,6 @@ static inline uint32_t amomax_w(volatile uint32_t *p, uint32_t val) {
     return old;
 }
 
-#else
-
-/* Non-RISC-V fallback stubs for development only */
-static inline uint32_t amoadd_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = old + val; return old;
-}
-static inline uint32_t amoxor_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = old ^ val; return old;
-}
-static inline uint32_t amoand_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = old & val; return old;
-}
-static inline uint32_t amoor_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = old | val; return old;
-}
-static inline uint32_t amoswap_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = val; return old;
-}
-static inline uint32_t amomin_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = ((int32_t)val < (int32_t)old) ? val : old; return old;
-}
-static inline uint32_t amomax_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = ((int32_t)val > (int32_t)old) ? val : old; return old;
-}
-static inline uint32_t amominu_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = (val < old) ? val : old; return old;
-}
-static inline uint32_t amomaxu_w(volatile uint32_t *p, uint32_t val) {
-    uint32_t old = *p; *p = (val > old) ? val : old; return old;
-}
-
-#endif
-
 //============================================================================
 //   Deterministic Workload
 //============================================================================
@@ -438,105 +464,139 @@ typedef struct {
     uint64_t worst_cycles;
 } run_result_t;
 
-//--------------------------------------------------------------------------
-//   workload_windowed
-//--------------------------------------------------------------------------
-//   Execute a deterministic synthetic workload for 'steps' iterations.
-//-------------------------------------------------------------------------- 
+/* ----------------------------------------------------------------------------
+   workload_windowed
+   ----------------------------------------------------------------------------
+   This function is the core synthetic workload used by the fuzzing runner compiled
+   and ran on each target board.
+
+   The goal is to generate a deterministic pattern that can expose architectural
+   differences across boards.
+
+   This function turns one seed into one reproducible stress pattern, and that
+   stress pattern is used to find architectural differences through repeated,
+   comparable execution across multiple boards.
+
+   Architectual Differential Fuzzing Process (ADFP):
+     1. The same seed and step count are sent to multiple boards.
+     2. Each board executes the same intended workload.
+     3. If the boards differ in timing, atomic behavior, memory behavior,
+        instruction implementation, or platform effects, their measured results
+        may diverge.
+     4. The host compares those results and scores seeds that produce the most
+        interesting differences.
+
+   Workload structure:
+     - ALU-heavy math stresses arithmetic datapaths and compiler codegen.
+     - Memory loads/stores to stress caches, buses, and memory subsystems.
+     - Data-dependent indexing makes access patterns harder to predict.
+     - Atomic AMO operations stress ordering and architectural support for the
+       RISC-V A-extension.
+     - Occasional branch-like alterations to create control-flow variation.
+     - Windowed timing identifies *where* in the run the highest timing cost
+       occurred, not just the total time.
+
+   Function results:
+     - checksum      : a deterministic summary of the computed data path
+     - total_cycles  : total run time (using monotonic clock) for the entire workload
+     - worst_window  : which timing window was slowest
+     - worst_cycles  : how slow that worst window was
+     - flags         : reserved for future anomaly markers
+   ---------------------------------------------------------------------------- */
 static run_result_t workload_windowed(uint32_t seed, int steps) {
-    run_result_t rr;
-    memset(&rr, 0, sizeof(rr));
+    run_result_t rr;                                  /* Create the result struct that will hold checksum, timing, and window info. */
+    memset(&rr, 0, sizeof(rr));                      /* Start with all result fields cleared so defaults are known and safe. */
 
-    uint32_t st  = seed ^ 0xA5A5A5A5u;
-    uint32_t acc = 0x12345678u;
+    uint32_t st  = seed ^ 0xA5A5A5A5u;               /* Initialize the pseudo-random state from the input seed, but mix it first so small seed patterns do not map too directly into the generator state. */
+    uint32_t acc = 0x12345678u;                      /* Initialize the running accumulator/checksum state with a non-zero constant so the workload starts from a fixed, known baseline. */
 
-    int n_windows = (steps + WINDOW_SIZE - 1) / WINDOW_SIZE;
-    if (n_windows > MAX_WINDOWS) {
-        n_windows = MAX_WINDOWS;
+    int n_windows = (steps + WINDOW_SIZE - 1) / WINDOW_SIZE; /* Compute how many fixed-size timing windows are needed to cover the requested step count, rounding up for partial final windows. */
+    if (n_windows > MAX_WINDOWS) {                   /* Guard against excessive window counts so the workload stays inside the designed analysis limits. */
+        n_windows = MAX_WINDOWS;                     /* Clamp the number of windows to the maximum supported value. */
     }
 
-    for (int i = 0; i < 1024; i++) {
-        uint32_t r = xorshift32(&st);
-        mem[r % MEM_WORDS] ^= (r + (uint32_t)i);
+    for (int i = 0; i < 1024; i++) {                 /* Run a deterministic warm-up loop to initialize scratch memory into a seed-dependent state before timing the main workload. */
+        uint32_t r = xorshift32(&st);                /* Advance the deterministic pseudo-random generator to get the next workload-driving value. */
+        mem[r % MEM_WORDS] ^= (r + (uint32_t)i);     /* Touch memory at a pseudo-random location and perturb it so later operations depend on a nontrivial, seed-specific memory state. */
     }
 
-    uint64_t total_start = monotonic_ticks_u64();
+    uint64_t total_start = monotonic_ticks_u64();    /* Record the start time of the full workload so total execution cost can be measured. */
 
-    for (int w = 0; w < n_windows; w++) {
-        int step_begin = w * WINDOW_SIZE;
-        int step_end   = step_begin + WINDOW_SIZE;
-        if (step_end > steps) {
-            step_end = steps;
+    for (int w = 0; w < n_windows; w++) {            /* Iterate over timing windows so the run can be analyzed in smaller regions, not only as one total block. */
+        int step_begin = w * WINDOW_SIZE;            /* Compute the first step index belonging to this window. */
+        int step_end   = step_begin + WINDOW_SIZE;   /* Compute the nominal end step index for this window. */
+        if (step_end > steps) {                      /* Check whether the last window would run past the requested number of steps. */
+            step_end = steps;                        /* Trim the final window so the total number of executed steps exactly matches the request. */
         }
 
-        uint64_t w0 = monotonic_ticks_u64();
+        uint64_t w0 = monotonic_ticks_u64();         /* Record the start time of this window so its local timing cost can be measured. */
 
-        for (int i = step_begin; i < step_end; i++) {
-            uint32_t r = xorshift32(&st);
+        for (int i = step_begin; i < step_end; i++) { /* Execute each step in this timing window. */
+            uint32_t r = xorshift32(&st);            /* Generate the next deterministic pseudo-random value that drives this step’s behavior. */
 
             /* ALU-heavy section */
-            acc ^= (r * 2654435761u);
-            acc += (acc << 7) ^ (r >> 3);
-            acc = (acc << 3) | (acc >> 29);
+            acc ^= (r * 2654435761u);                /* Mix the random value into the accumulator with multiplication and XOR to exercise integer datapaths and create nontrivial data evolution. */
+            acc += (acc << 7) ^ (r >> 3);            /* Combine shifts, XOR, and addition to create more varied arithmetic pressure and data dependencies. */
+            acc = (acc << 3) | (acc >> 29);          /* Perform a rotate-like operation so bits move across positions and the accumulator remains highly mixed. */
 
             /* Normal memory section */
-            uint32_t idx = (r ^ acc) % MEM_WORDS;
-            uint32_t v   = mem[idx];
+            uint32_t idx = (r ^ acc) % MEM_WORDS;    /* Choose a memory index based on both current pseudo-random state and accumulator state, making accesses data-dependent and less predictable. */
+            uint32_t v   = mem[idx];                 /* Load the current value from the selected scratch-memory location. */
 
-            v ^= (acc + r);
-            v += (v << 11) ^ (v >> 9);
-            mem[idx] = v;
+            v ^= (acc + r);                          /* Perturb the loaded value with current arithmetic state so memory contents evolve with execution history. */
+            v += (v << 11) ^ (v >> 9);               /* Apply more local arithmetic mixing to amplify differences in data patterns and instruction mix. */
+            mem[idx] = v;                            /* Store the updated value back into memory, creating a read-modify-write memory access pattern. */
 
-            acc ^= mem[(idx + (acc & 1023u)) % MEM_WORDS];
+            acc ^= mem[(idx + (acc & 1023u)) % MEM_WORDS]; /* Perform a second dependent memory read using both the current index and low bits of the accumulator, making later behavior depend on earlier state and memory contents. */
 
             /* Atomic stress section using explicit RISC-V AMO operations */
-            if ((r & 0x1Fu) == 0u) {
-                volatile uint32_t *aptr = &mem[(idx + 17u) % MEM_WORDS];
+            if ((r & 0x1Fu) == 0u) {                 /* Only execute the atomic stress block occasionally so it influences the workload without completely dominating every step. */
+                volatile uint32_t *aptr = &mem[(idx + 17u) % MEM_WORDS]; /* Select a nearby scratch-memory word for atomic operations; mark the pointer volatile so the explicit AMO memory side effects are preserved as intended. */
 
-                uint32_t old_add  = amoadd_w(aptr, (r | 1u));
-                uint32_t old_xor  = amoxor_w(aptr, acc);
-                uint32_t old_and  = amoand_w(aptr, ~r);
-                uint32_t old_or   = amoor_w(aptr, (acc | 1u));
-                uint32_t old_swap = amoswap_w(aptr, r ^ acc);
+                uint32_t old_add  = amoadd_w(aptr, (r | 1u));           /* Atomically add a pseudo-random odd value and capture the old memory value; this stresses arithmetic AMO behavior. */
+                uint32_t old_xor  = amoxor_w(aptr, acc);                /* Atomically XOR the accumulator into memory and capture the previous value; this stresses bitwise AMO behavior. */
+                uint32_t old_and  = amoand_w(aptr, ~r);                 /* Atomically AND memory with the inverse of the random value and capture the previous value. */
+                uint32_t old_or   = amoor_w(aptr, (acc | 1u));          /* Atomically OR memory with the accumulator and capture the previous value. */
+                uint32_t old_swap = amoswap_w(aptr, r ^ acc);           /* Atomically replace memory entirely and capture the previous value, stressing exchange semantics. */
 
-                uint32_t old_min  = amomin_w(aptr, r);
-                uint32_t old_max  = amomax_w(aptr, acc);
-                uint32_t old_umin = amominu_w(aptr, r ^ 0xAAAAAAAAu);
-                uint32_t old_umax = amomaxu_w(aptr, acc ^ 0x55555555u);
+                uint32_t old_min  = amomin_w(aptr, r);                  /* Atomically perform a signed minimum update and capture the previous value. */
+                uint32_t old_max  = amomax_w(aptr, acc);                /* Atomically perform a signed maximum update and capture the previous value. */
+                uint32_t old_umin = amominu_w(aptr, r ^ 0xAAAAAAAAu);   /* Atomically perform an unsigned minimum update and capture the previous value. */
+                uint32_t old_umax = amomaxu_w(aptr, acc ^ 0x55555555u); /* Atomically perform an unsigned maximum update and capture the previous value. */
 
-                acc ^= old_add;
-                acc += old_xor;
-                acc ^= old_and;
-                acc += old_or;
-                acc ^= old_swap;
-                acc += old_min;
-                acc ^= old_max;
-                acc += old_umin;
-                acc ^= old_umax;
+                acc ^= old_add;                         /* Fold the old result of the atomic add into the accumulator so the final checksum depends on AMO behavior. */
+                acc += old_xor;                         /* Fold the old result of the atomic XOR into the accumulator. */
+                acc ^= old_and;                         /* Fold the old result of the atomic AND into the accumulator. */
+                acc += old_or;                          /* Fold the old result of the atomic OR into the accumulator. */
+                acc ^= old_swap;                        /* Fold the old result of the atomic swap into the accumulator. */
+                acc += old_min;                         /* Fold the old result of the signed min AMO into the accumulator. */
+                acc ^= old_max;                         /* Fold the old result of the signed max AMO into the accumulator. */
+                acc += old_umin;                        /* Fold the old result of the unsigned min AMO into the accumulator. */
+                acc ^= old_umax;                        /* Fold the old result of the unsigned max AMO into the accumulator. */
             }
 
             /* Occasional branch-like perturbation */
-            if ((r & 0x3FFu) == 0x155u) {
-                acc ^= 0xDEADBEEFu;
+            if ((r & 0x3FFu) == 0x155u) {              /* Occasionally take an alternate path based on the pseudo-random pattern so the control-flow profile is not completely uniform. */
+                acc ^= 0xDEADBEEFu;                    /* Perturb the accumulator strongly when that rare condition is met, making branch timing and path differences visible in results. */
             }
         }
 
-        uint64_t w1 = monotonic_ticks_u64();
-        uint64_t wcycles = w1 - w0;
+        uint64_t w1 = monotonic_ticks_u64();          /* Record the end time of the current window. */
+        uint64_t wcycles = w1 - w0;                   /* Compute the elapsed time for just this window. */
 
-        if (wcycles > rr.worst_cycles) {
-            rr.worst_cycles = wcycles;
-            rr.worst_window = (uint32_t)w;
+        if (wcycles > rr.worst_cycles) {              /* Check whether this window is the slowest one seen so far. */
+            rr.worst_cycles = wcycles;                /* Save the timing of the slowest window so far. */
+            rr.worst_window = (uint32_t)w;            /* Save which window index produced that worst timing. */
         }
     }
 
-    uint64_t total_end = monotonic_ticks_u64();
+    uint64_t total_end = monotonic_ticks_u64();       /* Record the end time of the full workload. */
 
-    rr.total_cycles = total_end - total_start;
-    rr.checksum     = acc;
-    rr.flags        = 0;
+    rr.total_cycles = total_end - total_start;        /* Save the total run time so the host can compare overall timing behavior across boards. */
+    rr.checksum     = acc;                            /* Save the final accumulator as the deterministic data-path summary for this seed/run. */
+    rr.flags        = 0;                              /* Leave flags clear for now; this field is reserved for future anomaly or fault markers. */
 
-    return rr;
+    return rr;                                        /* Return the completed result structure to the caller so it can be formatted into the DONE line. */
 }
 
 //============================================================================

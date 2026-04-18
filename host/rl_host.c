@@ -342,41 +342,210 @@ static double digital_divergence(const triple_t *t) {
 }
 
 //=============================================================================
-// UCB
+// UCB (Upper Confidence Bound) - Multi-Armed Bandit Strategy
 //=============================================================================
+/*
+Probability Theory:
+  - Multi-armed bandit problem: a framework for decision-making under uncertainty 
+  - UCB1 algorithm: a strategy for balancing exploration and exploitation 
 
+The multi-armed bandit problem is named from imagining a gambler at a row of 
+slot machines ("one-armed bandits"), who has to decide which machines to play, 
+how many times to play each machine and in which order to play them,
+and whether to continue with the current machine or try a different machine. [1]
+
+UCB1 is a specific algorithm for solving the multi-armed bandit problem. It works by
+assigning a score to each arm (configuration) that combines:
+  - the average reward observed from that arm (exploitation)
+  - a bonus term that encourages trying less-tested arms (exploration) [2]
+
+Ref: 
+[1] Weber, Richard (1992), "On the Gittins index for multiarmed bandits"
+[2] Auer, Cesa-Bianchi and Fischer (2002), "Finite-time Analysis of the Multiarmed Bandit Problem"
+
+This section implements a simple reinforcement learning strategy (UCB1) used
+by the host to decide *which test configuration to run next*.
+
+  - Each "arm" represents a different workload configuration (typically a
+    different step count).
+  - Each run produces a "reward" (how much divergence or interesting behavior
+    was observed across boards).
+  - The goal is to automatically focus testing effort on configurations that
+    produce the most interesting architectural differences.
+
+Instead of blindly testing all configurations equally, UCB1 balances:
+  - Exploration  - try new or under-tested configurations
+  - Exploitation - focus on configurations that already showed strong signals
+
+This dramatically improves efficiency when searching for:
+  - timing divergence
+  - atomic behavior differences
+  - microarchitectural inconsistencies
+  - power analysis differences
+------------------------------------------------------------------------------
+*/
+
+/*
+------------------------------------------------------------------------------
+arm_t
+------------------------------------------------------------------------------
+Represents one "arm" in the bandit problem.
+
+In this system, an arm corresponds to:
+  → a specific workload configuration (e.g., a specific step count)
+
+Each arm tracks how well that configuration performs in terms of producing
+useful fuzzing signals.
+------------------------------------------------------------------------------
+*/
 typedef struct {
-    int steps;
-    uint64_t pulls;
-    double mean;
+    int steps;           /* The number of steps used when running this arm.
+                           This directly controls workload duration and stress. */
+
+    uint64_t pulls;     /* How many times this configuration has been tested.
+                           More pulls = more confidence in its observed behavior. */
+
+    double mean;        /* Running average reward for this configuration.
+                           Reward reflects how much architectural divergence
+                           this configuration has produced historically. */
 } arm_t;
 
-static int choose_ucb(arm_t *a, int n) {
-    uint64_t total = 0;
-    for (int i = 0; i < n; i++) total += a[i].pulls;
 
+/*
+------------------------------------------------------------------------------
+choose_ucb
+------------------------------------------------------------------------------
+Selects the next arm (configuration) to run using the UCB1 algorithm.
+
+This is the "decision engine" of the Architecture Fuzzing Board Process (AFBP).
+Answering which workload configuration should be tested next.
+
+UCB formula:
+  value = mean_reward + exploration_bonus
+
+Where:
+  - mean_reward = how good this arm has been so far
+  - bonus       = encourages trying less-tested arms
+
+This ensures:
+  - High-performing configs are reused
+  - Under-tested configs are still explored
+------------------------------------------------------------------------------
+*/
+static int choose_ucb(arm_t *a, int n) {
+
+    uint64_t total = 0;                     /* Total number of pulls across all arms.
+                                               This represents total experiment count. */
+
+    for (int i = 0; i < n; i++)             /* Sum pulls across all arms. */
+        total += a[i].pulls;
+
+    /*
+    --------------------------------------------------------------------------
+    Exploration guarantee:
+    --------------------------------------------------------------------------
+    If any arm has never been tested, choose it immediately.
+
+    Why:
+      - UCB1 requires at least one sample per arm
+      - Ensures no configuration is ignored
+      - Guarantees baseline coverage across all step sizes
+    */
     for (int i = 0; i < n; i++) {
-        if (a[i].pulls == 0) return i;
+        if (a[i].pulls == 0)
+            return i;                       /* Force exploration of new arm */
     }
 
-    double best = -1e300;
-    int best_i = 0;
+    double best = -1e300;                  /* Initialize best score to a very small number so any real value wins. */
 
+    int best_i = 0;                        /* Track index of best arm found so far */
+
+    /*
+    --------------------------------------------------------------------------
+    Core UCB selection loop
+    --------------------------------------------------------------------------
+    Evaluate each arm using:
+
+      UCB = mean + sqrt(2 * log(total) / pulls)
+
+    Interpretation:
+      - mean - exploitation (how good it is)
+      - sqrt(...) - exploration bonus
+    */
     for (int i = 0; i < n; i++) {
-        double bonus = sqrt(2.0 * log((double)total) / (double)a[i].pulls);
+
+        /*
+        Exploration bonus:
+          - Larger when pulls is small - favors under-tested arms
+          - Shrinks as pulls increases - trust established arms more
+        */
+        double bonus = sqrt(
+            2.0 * log((double)total) / (double)a[i].pulls
+        );
+
+        /* Total value for this arm:
+          - mean reward (exploitation)
+          + exploration bonus
+        */
         double val = a[i].mean + bonus;
+
+        /* Select arm with highest UCB value */
         if (val > best) {
             best = val;
             best_i = i;
         }
     }
 
-    return best_i;
+    return best_i; /* Return index of chosen configuration */
 }
 
+
+/*
+------------------------------------------------------------------------------
+update_arm
+------------------------------------------------------------------------------
+Updates statistics for an arm after a run completes.
+
+Inputs:
+  - a : pointer to the arm being updated
+  - r : reward from the most recent run
+
+Reward in your system typically reflects:
+  - divergence between boards
+  - timing differences
+  - anomalous behavior
+
+This function updates:
+  - how many times the arm was used
+  - its average reward
+
+This feeds back into UCB for future decisions.
+------------------------------------------------------------------------------
+*/
 static void update_arm(arm_t *a, double r) {
-    a->pulls++;
+
+    a->pulls++; /* Increment usage count. This reduces exploration bonus for this arm in future selections. */
+
+    /*Learning rate: alpha = 1 / pulls
+
+    This implements an incremental average:
+      - Early runs have large influence
+      - Later runs refine the estimate more slowly
+    */
     double alpha = 1.0 / (double)a->pulls;
+
+    /*
+    Running mean update:
+
+      new_mean = (1 - alpha)*old_mean + alpha*reward
+
+    Equivalent to:
+      mean = average of all observed rewards
+
+    Why this matters:
+      - Tracks how "interesting" this configuration is
+      - Drives exploitation in UCB selection
+    */
     a->mean = (1.0 - alpha) * a->mean + alpha * r;
 }
 
