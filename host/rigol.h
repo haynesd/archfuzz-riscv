@@ -40,6 +40,16 @@ typedef struct {
     double trigger_threshold_v;
     size_t pre_trigger_samples;
     size_t window_samples;
+    /*
+     * Optional explicit timebase configuration, sent via SCPI before arming
+     * the single-shot capture. A value of 0 leaves the scope's timebase
+     * exactly as manually configured on the front panel (prior behavior).
+     * Set both when the acquisition window must be scripted/reproducible,
+     * e.g. to guarantee CH1-CH3 activity from all sequential board runs
+     * lands inside the single captured record.
+     */
+    double timebase_scale_s;
+    double timebase_offset_s;
     bool enabled;
 } rigol_config_t;
 

@@ -419,7 +419,7 @@ static inline uint32_t amomax_w(volatile uint32_t *p, uint32_t val) {
 }
 
 /* Unsigned comparison AMOs */
-static inline uint32_t amomin_w(volatile uint32_t *p, uint32_t val) {
+static inline uint32_t amominu_w(volatile uint32_t *p, uint32_t val) {
     uint32_t old;
     asm volatile (
         "amominu.w %0, %2, (%1)"
@@ -430,7 +430,7 @@ static inline uint32_t amomin_w(volatile uint32_t *p, uint32_t val) {
     return old;
 }
 
-static inline uint32_t amomax_w(volatile uint32_t *p, uint32_t val) {
+static inline uint32_t amomaxu_w(volatile uint32_t *p, uint32_t val) {
     uint32_t old;
     asm volatile (
         "amomaxu.w %0, %2, (%1)"

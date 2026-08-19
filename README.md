@@ -90,19 +90,18 @@ archdiff-riscv
 │
 ├── fpga/
 |   ├── fpga_fuzz_ctrl.v
-|   ├── fpga_fuzz_ctrl.xdc
+|   ├── fpga_fuzz.ctrl.xdc
 |   ├── uart_rx.v
 |   ├── uart_tx.v
 ├── board/
 |   ├── runner.c
 ├── host/
-│   ├── BUILD_MING_W64.tx
 │   ├── BUILD_VISUAL_STUDIO_2022.md
 │   ├── CMakeLists.txt
-│   ├── Common.h
+│   ├── common.h
 │   ├── logging.c
 │   ├── main.c
-│   ├── rigol_client
+│   ├── rigol_client.c
 │   ├── rigol.c
 │   ├── rigol.h
 │   ├── rl.c
@@ -119,14 +118,50 @@ cmake -S . -B build -G "Visual Studio 17 2022"
 cmake --build build --config Debug
 cmake --build build --config Release
 
-## GCC
-gcc -O2 -Wall -Wextra -std=c11 -o rl_host.exe main.c serial.c rigol.c waveform.c rl.c logging.c -lws2_32 -lm
+## GCC (MinGW-w64)
+
+No CMake/make/ninja needed for this path — one direct compiler invocation
+compiles all six sources and links `ws2_32` (Winsock, for the Rigol TCP/SCPI
+client). Run from inside `host/`.
+
+Git Bash / MSYS2 shell (backslash line continuation):
+
+    gcc -O2 -Wall -Wextra -std=c11 \
+      -o rl_host.exe \
+      main.c serial.c rigol.c waveform.c rl.c logging.c \
+      -lws2_32 -lm
+
+PowerShell / cmd.exe (single line — backslash continuation doesn't work there):
+
+    gcc -O2 -Wall -Wextra -std=c11 -o rl_host.exe main.c serial.c rigol.c waveform.c rl.c logging.c -lws2_32 -lm
+
+If `gcc` isn't found, make sure a MinGW-w64 `gcc.exe` (e.g. from MSYS2's
+`mingw64` environment) is on `PATH` — running `gcc --version` should report
+an `x86_64-w64-mingw32` target, not a Linux one.
 
 ---
 
 # Running
 
-rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555 CHAN1
+rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555
+
+## Reproducible / unattended campaigns
+
+By default the seed-selection PRNG is seeded from the current time, so
+consecutive runs explore different seeds. For a reproducible campaign, or one
+that runs unattended for hours/days, use:
+
+    rl_host.exe --rng-seed 42 --results run1.csv --checkpoint run1.ckpt rl COM5 16 65536
+
+- `--rng-seed <N>`  makes the explored seed sequence reproducible across runs.
+- `--results <FILE>` appends one CSV row per iteration (seed, steps, per-board
+  scores/flags/timing, wave divergence, reward) for offline analysis.
+- `--checkpoint <FILE>` persists UCB bandit statistics periodically so the
+  campaign can resume after being interrupted, instead of restarting the
+  bandit from scratch.
+
+These flags apply to both `rl` and `rl_scope` and must precede the mode name.
+Run `rl_host.exe` with no arguments for the full flag/usage list.
 
 ---
 

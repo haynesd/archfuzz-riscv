@@ -397,7 +397,11 @@ int main(int argc, char **argv) {
 
     /* Optional acquisition setup - adjust to your experiment */
     scpi_write(sock, ":TRIG:MODE EDGE");
-    scpi_write(sock, ":TRIG:EDGE:SOUR CHAN2");
+    {
+        char trig_cmd[128];
+        snprintf(trig_cmd, sizeof(trig_cmd), ":TRIG:EDGE:SOUR %s", channel);
+        scpi_write(sock, trig_cmd);
+    }
     scpi_write(sock, ":TRIG:EDGE:SLOP POS");
 
     /* Read waveform preamble */

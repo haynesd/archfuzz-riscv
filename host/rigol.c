@@ -29,6 +29,14 @@ typedef struct {
 #define RIGOL_SOCK_ERR INVALID_SOCKET
 #define RIGOL_MAX_LINE 4096
 
+/*
+ * Socket-level recv/send timeout for the scope link. Without this, a dropped
+ * network connection or a scope that stops responding mid-capture blocks the
+ * host process forever with no diagnostic, which is fatal for an unattended
+ * multi-hour/day fuzzing campaign.
+ */
+#define RIGOL_SOCK_TIMEOUT_MS 15000
+
 static void rigol_die_wsa(const char *msg) {
     rl_log_message(RL_LOG_ERROR, "%s (WSA=%d)", msg, WSAGetLastError());
     rl_log_close();
@@ -78,6 +86,12 @@ static rigol_socket_t rigol_tcp_connect(const char *host, const char *port) {
 
     if (sock == RIGOL_SOCK_ERR) {
         rigol_die_wsa("scope connect failed");
+    }
+
+    DWORD timeout_ms = RIGOL_SOCK_TIMEOUT_MS;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms)) != 0 ||
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms)) != 0) {
+        rl_log_message(RL_LOG_WARN, "Failed to set scope socket timeout (WSA=%d)", WSAGetLastError());
     }
 
     return sock;
@@ -288,6 +302,17 @@ void rigol_arm_single_capture(const rigol_config_t *config) {
 
     rigol_scpi_query(sock, "*IDN?", idn, sizeof(idn));
     rl_log_message(RL_LOG_INFO, "Rigol IDN: %s", idn);
+
+    if (config->timebase_scale_s > 0.0) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), ":TIM:SCAL %.9e", config->timebase_scale_s);
+        rigol_scpi_write(sock, cmd);
+    }
+    if (config->timebase_offset_s != 0.0) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), ":TIM:OFFS %.9e", config->timebase_offset_s);
+        rigol_scpi_write(sock, cmd);
+    }
 
     rigol_scpi_write(sock, ":RUN");
     rigol_scpi_write(sock, ":SING");
