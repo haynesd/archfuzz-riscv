@@ -14,6 +14,7 @@ to automatically identify **architectural, microarchitectural, and side-channel 
 
 # System Architecture
 
+```text
 HOST PC (rl_host)
    │
    │ UART (FT232)
@@ -26,6 +27,7 @@ FPGA Controller (Nexys A7)
    └── UART2 → Board C
    │
    └── Trigger → Oscilloscope CH4
+```
 
 Boards → Power Shunts → Oscilloscope CH1–CH3
 
@@ -35,12 +37,14 @@ Execution is **sequential per board** to ensure clean waveform capture.
 
 # Waveform Alignment
 
+```text
 Time →
         ┌──────────── Execution Window ────────────┐
 Board A     ____/''''''''''''''''''''''''''''\____
 Board B     ___/'''''''''''''''''''''''''''''\___
 Board C     ____/''''''''''''''''''''''''''''\____
                  ↑ Trigger (FPGA)
+```
 
 Process:
 1. FPGA emits trigger pulse (CH4)
@@ -52,6 +56,7 @@ Process:
 
 # RL Loop
 
+```text
 Select Action (UCB)
         ↓
 Send RUN Command
@@ -63,6 +68,7 @@ Collect Results + Waveforms
 Compute Reward
         ↓
 Update Policy
+```
 
 ---
 
@@ -83,40 +89,46 @@ Fault:
 D_fault = K if mismatch else 0
 
 ---
+
 # Repository Structure
-archdiff-riscv
-│
+
+```text
+archfuzz-riscv/
 ├── README.md
-│
+├── LICENSE
 ├── fpga/
-|   ├── fpga_fuzz_ctrl.v
-|   ├── fpga_fuzz.ctrl.xdc
-|   ├── uart_rx.v
-|   ├── uart_tx.v
+│   ├── fpga_fuzz_ctrl.v
+│   ├── fpga_fuzz.ctrl.xdc
+│   ├── uart_rx.v
+│   └── uart_tx.v
 ├── board/
-|   ├── runner.c
-├── host/
-│   ├── BUILD_VISUAL_STUDIO_2022.md
-│   ├── CMakeLists.txt
-│   ├── common.h
-│   ├── logging.c
-│   ├── main.c
-│   ├── rigol_client.c
-│   ├── rigol.c
-│   ├── rigol.h
-│   ├── rl.c
-│   ├── rl.h
-│   ├── serial.c
-│   ├── serial.h
-│   ├── waveform.c
-│   ├── waveform.h
+│   └── runner.c
+└── host/
+    ├── BUILD_VISUAL_STUDIO_2022.md
+    ├── CMakeLists.txt
+    ├── common.h
+    ├── logging.c
+    ├── main.c
+    ├── rigol.c
+    ├── rigol.h
+    ├── rigol_client.c
+    ├── rl.c
+    ├── rl.h
+    ├── serial.c
+    ├── serial.h
+    ├── waveform.c
+    └── waveform.h
+```
+
+---
 
 # Building
 
 ## Visual Studio 2022
-cmake -S . -B build -G "Visual Studio 17 2022"
-cmake --build build --config Debug
-cmake --build build --config Release
+
+    cmake -S . -B build -G "Visual Studio 17 2022"
+    cmake --build build --config Debug
+    cmake --build build --config Release
 
 ## GCC (MinGW-w64)
 
@@ -143,7 +155,7 @@ an `x86_64-w64-mingw32` target, not a Linux one.
 
 # Running
 
-rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555
+    rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555
 
 ## Reproducible / unattended campaigns
 
