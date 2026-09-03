@@ -173,6 +173,14 @@ module fpga_fuzz_ctrl #(
     reg [7:0] board_rx_byte;
 
     // =========================================================================
+    // One-byte buffer so a host payload byte is not lost while the selected
+    // board's UART TX is still busy sending the previous byte. Symmetric to
+    // board_rx_pending/board_rx_byte above.
+    // =========================================================================
+    reg       host_tx_pending;
+    reg [7:0] host_tx_byte;
+
+    // =========================================================================
     // FSM states
     // =========================================================================
     localparam [2:0]
@@ -260,6 +268,8 @@ module fpga_fuzz_ctrl #(
             timeout_cnt     <= {TIMEOUT_W{1'b0}};
             board_rx_pending<= 1'b0;
             board_rx_byte   <= 8'h00;
+            host_tx_pending <= 1'b0;
+            host_tx_byte    <= 8'h00;
         end else begin
             h_tx_start  <= 1'b0;
             b0_tx_start <= 1'b0;
@@ -272,6 +282,12 @@ module fpga_fuzz_ctrl #(
                 board_rx_byte    <= sel_rx_data;
             end
 
+            // Capture host payload byte into one-byte buffer
+            if (h_rx_valid && !host_tx_pending) begin
+                host_tx_pending <= 1'b1;
+                host_tx_byte    <= h_rx_data;
+            end
+
             case (state)
 
                 // -------------------------------------------------------------
@@ -281,6 +297,7 @@ module fpga_fuzz_ctrl #(
                     trig_out         <= 1'b0;
                     timeout_cnt      <= {TIMEOUT_W{1'b0}};
                     board_rx_pending <= 1'b0;
+                    host_tx_pending  <= 1'b0;
 
                     if (h_rx_valid && h_rx_data == 8'h01)
                         state <= ST_GET_BRD;
@@ -290,6 +307,16 @@ module fpga_fuzz_ctrl #(
                 // Read board ID
                 // -------------------------------------------------------------
                 ST_GET_BRD: begin
+                    // Cleared every cycle so a stray board byte captured
+                    // while still selecting/addressing (e.g. a straggling
+                    // response byte from a previously timed-out board) can
+                    // never leak into this new transaction's response, and a
+                    // host byte captured here (e.g. the board-ID byte itself)
+                    // is never replayed to the board as payload once ST_SEND
+                    // starts.
+                    board_rx_pending <= 1'b0;
+                    host_tx_pending  <= 1'b0;
+
                     if (h_rx_valid) begin
                         if (h_rx_data < 8'd3) begin
                             active_board <= h_rx_data[1:0];
@@ -303,27 +330,38 @@ module fpga_fuzz_ctrl #(
 
                 // -------------------------------------------------------------
                 // Forward payload to selected board until newline
+                //
+                // Bytes are relayed via host_tx_pending/host_tx_byte rather
+                // than acting on h_rx_valid/h_rx_data directly: h_rx_valid
+                // only pulses for one clock, and if the selected board's TX
+                // is still busy with the previous byte at that exact cycle,
+                // an unbuffered byte would simply be lost (host RX and board
+                // TX run at the same baud rate, so this race is easy to hit
+                // on a back-to-back payload write, not just a rare corner
+                // case).
                 // -------------------------------------------------------------
                 ST_SEND: begin
-                    if (h_rx_valid && !sel_tx_busy) begin
+                    if (host_tx_pending && !sel_tx_busy) begin
                         case (active_board)
                             2'd0: begin
-                                b0_tx_data  <= h_rx_data;
+                                b0_tx_data  <= host_tx_byte;
                                 b0_tx_start <= 1'b1;
                             end
 
                             2'd1: begin
-                                b1_tx_data  <= h_rx_data;
+                                b1_tx_data  <= host_tx_byte;
                                 b1_tx_start <= 1'b1;
                             end
 
                             default: begin
-                                b2_tx_data  <= h_rx_data;
+                                b2_tx_data  <= host_tx_byte;
                                 b2_tx_start <= 1'b1;
                             end
                         endcase
 
-                        if (h_rx_data == 8'h0A) begin
+                        host_tx_pending <= 1'b0;
+
+                        if (host_tx_byte == 8'h0A) begin
                             timeout_cnt      <= {TIMEOUT_W{1'b0}};
                             board_rx_pending <= 1'b0;
                             state            <= ST_WAIT_RESP;

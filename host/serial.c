@@ -167,7 +167,10 @@ bool serial_read_line(serial_t *serial, char *line, int line_size) {
         die("ReadFile failed");
     }
     if (count > 0) {
-        rl_log_message(RL_LOG_INFO, "[HOST RX] %s", line);
+        char hexbuf[1024];
+        serial_dump_bytes_hex((const uint8_t *)line, count, hexbuf, sizeof(hexbuf));
+        rl_log_message(RL_LOG_DEBUG, "[HOST RX HEX] %s", hexbuf);
+        rl_log_message(RL_LOG_INFO, "[HOST RX ASCII] %s", line);
     }
     return count != 0;
 }

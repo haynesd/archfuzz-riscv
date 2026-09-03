@@ -1,0 +1,8 @@
+# =============================================================================
+# Vivado project build artifacts (project name: fpga)
+# =============================================================================
+/fpga.cache/
+/fpga.hw/
+/fpga.ip_user_files/
+/fpga.runs/
+/fpga.sim/

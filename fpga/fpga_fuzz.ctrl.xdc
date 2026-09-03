@@ -18,6 +18,13 @@
 # ============================================================================
 
 # ============================================================================
+# CONFIGURATION (required for Artix-7 bitstream generation on Nexys A7;
+# Vivado will flag/refuse bitstream generation without these)
+# ============================================================================
+set_property CFGBVS VCCO [current_design]
+set_property CONFIG_VOLTAGE 3.3 [current_design]
+
+# ============================================================================
 # CLOCK (100 MHz onboard oscillator)
 # ============================================================================
 set_property PACKAGE_PIN E3 [get_ports clk]
