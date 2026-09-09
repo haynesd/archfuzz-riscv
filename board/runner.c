@@ -25,7 +25,7 @@ Supported commands:
 
   2) RUN
        Input : RUN <seed_dec> <steps_dec>\n
-       Output: DONE <seed_dec> <score_dec> <flags_dec> <worst_window_dec> <worst_cycles_dec>\n
+       Output: DONE <seed_dec> <score_dec> <flags_dec> <worst_window_dec> <worst_ns_dec>\n
 
 The RUN command executes a deterministic synthetic workload driven by the seed.
 The workload is divided into fixed-size windows so timing hotspots can be
@@ -137,7 +137,7 @@ Example console output:
   [TX] PONG\n
   [RX] RUN 12345 256\n
   [RUN] seed=12345 steps=256
-  [DONE] seed=12345 score=987654321 flags=0 worst_window=5 worst_cycles=1842
+  [DONE] seed=12345 score=987654321 flags=0 worst_window=5 worst_ns=1842
   [TX] DONE 12345 987654321 0 5 1842\n
 
 BUILD (on-board)
@@ -459,9 +459,9 @@ static inline uint32_t xorshift32(uint32_t *s) {
 typedef struct {
     uint32_t checksum;
     uint32_t flags;
-    uint64_t total_cycles;
+    uint64_t total_ns;      /* wall-clock nanoseconds, from clock_gettime(CLOCK_MONOTONIC); not a CPU cycle count */
     uint32_t worst_window;
-    uint64_t worst_cycles;
+    uint64_t worst_ns;      /* wall-clock nanoseconds for the worst window; not a CPU cycle count */
 } run_result_t;
 
 /* ----------------------------------------------------------------------------
@@ -498,9 +498,9 @@ typedef struct {
 
    Function results:
      - checksum      : a deterministic summary of the computed data path
-     - total_cycles  : total run time (using monotonic clock) for the entire workload
+     - total_ns      : total run time in nanoseconds (clock_gettime(CLOCK_MONOTONIC)) for the entire workload
      - worst_window  : which timing window was slowest
-     - worst_cycles  : how slow that worst window was
+     - worst_ns      : how slow that worst window was, in nanoseconds
      - flags         : reserved for future anomaly markers
    ---------------------------------------------------------------------------- */
 static run_result_t workload_windowed(uint32_t seed, int steps) {
@@ -582,17 +582,17 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
         }
 
         uint64_t w1 = monotonic_ticks_u64();          /* Record the end time of the current window. */
-        uint64_t wcycles = w1 - w0;                   /* Compute the elapsed time for just this window. */
+        uint64_t w_ns = w1 - w0;                      /* Compute the elapsed nanoseconds for just this window. */
 
-        if (wcycles > rr.worst_cycles) {              /* Check whether this window is the slowest one seen so far. */
-            rr.worst_cycles = wcycles;                /* Save the timing of the slowest window so far. */
+        if (w_ns > rr.worst_ns) {                     /* Check whether this window is the slowest one seen so far. */
+            rr.worst_ns = w_ns;                       /* Save the timing of the slowest window so far. */
             rr.worst_window = (uint32_t)w;            /* Save which window index produced that worst timing. */
         }
     }
 
     uint64_t total_end = monotonic_ticks_u64();       /* Record the end time of the full workload. */
 
-    rr.total_cycles = total_end - total_start;        /* Save the total run time so the host can compare overall timing behavior across boards. */
+    rr.total_ns = total_end - total_start;            /* Save the total run time (ns) so the host can compare overall timing behavior across boards. */
     rr.checksum     = acc;                            /* Save the final accumulator as the deterministic data-path summary for this seed/run. */
     rr.flags        = 0;                              /* Leave flags clear for now; TBD */
 
@@ -653,17 +653,17 @@ int main(int argc, char **argv) {
 
         run_result_t rr = workload_windowed((uint32_t)seed, steps);
 
-        uint64_t score = rr.total_cycles ^ (uint64_t)rr.checksum;
+        uint64_t score = rr.total_ns ^ (uint64_t)rr.checksum;
 
         /* Human-readable local console summary */
         printf(
             "[DONE] seed=%u score=%" PRIu64
-            " flags=%u worst_window=%u worst_cycles=%" PRIu64 "\n",
+            " flags=%u worst_window=%u worst_ns=%" PRIu64 "\n",
             (uint32_t)seed,
             (uint64_t)score,
             (uint32_t)rr.flags,
             rr.worst_window,
-            rr.worst_cycles
+            rr.worst_ns
         );
         fflush(stdout);
 
@@ -677,7 +677,7 @@ int main(int argc, char **argv) {
             (uint64_t)score,
             (uint32_t)rr.flags,
             rr.worst_window,
-            rr.worst_cycles
+            rr.worst_ns
         );
 
         write_all(fd, out);

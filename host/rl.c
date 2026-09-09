@@ -58,7 +58,7 @@ bool rl_parse_done_line(const char *line, int board_index, triple_result_t *resu
     unsigned flags = 0;
     unsigned worst_window = 0;
     unsigned long long score = 0;
-    unsigned long long worst_cycles = 0;
+    unsigned long long worst_ns = 0;
 
     if (!line || !result || board_index < 0 || board_index >= RL_BOARD_COUNT) {
         return false;
@@ -70,7 +70,7 @@ bool rl_parse_done_line(const char *line, int board_index, triple_result_t *resu
                          &score,
                          &flags,
                          &worst_window,
-                         &worst_cycles);
+                         &worst_ns);
     if (matched != 5) {
         return false;
     }
@@ -79,44 +79,66 @@ bool rl_parse_done_line(const char *line, int board_index, triple_result_t *resu
     result->score[board_index] = (uint64_t)score;
     result->flags[board_index] = flags;
     result->worst_window[board_index] = worst_window;
-    result->worst_cycles[board_index] = (uint64_t)worst_cycles;
+    result->worst_ns[board_index] = (uint64_t)worst_ns;
     result->done[board_index] = true;
     result->ok = result->done[0] && result->done[1] && result->done[2];
     return true;
 }
 
-double rl_compute_digital_divergence(const triple_result_t *result) {
-    double d01 = fabs((double)result->score[0] - (double)result->score[1]);
-    double d02 = fabs((double)result->score[0] - (double)result->score[2]);
-    double d12 = fabs((double)result->score[1] - (double)result->score[2]);
+double rl_compute_digital_divergence(const triple_result_t *result, int skip_board) {
+    double d_semantic = 0.0;
+    double timing_ns_term = 0.0;
 
-    double d_semantic = (d01 + d02 + d12) / 1000.0;
+    for (int i = 0; i < RL_BOARD_COUNT; ++i) {
+        if (i == skip_board) {
+            continue;
+        }
+        for (int j = i + 1; j < RL_BOARD_COUNT; ++j) {
+            if (j == skip_board) {
+                continue;
+            }
+            d_semantic += fabs((double)result->score[i] - (double)result->score[j]);
+            timing_ns_term += fabs((double)result->worst_ns[i] - (double)result->worst_ns[j]);
+        }
+    }
+    d_semantic /= 1000.0;
 
     double d_fault = 0.0;
     for (int i = 0; i < RL_BOARD_COUNT; ++i) {
+        if (i == skip_board) {
+            continue;
+        }
         if (result->flags[i] != 0) {
             d_fault += 1e6;
         }
     }
 
     double window_bonus = 0.0;
-    if (!(result->worst_window[0] == result->worst_window[1] &&
-          result->worst_window[1] == result->worst_window[2])) {
-        window_bonus = 2e5;
+    {
+        int first_window = -1;
+        bool mismatch = false;
+        for (int i = 0; i < RL_BOARD_COUNT; ++i) {
+            if (i == skip_board) {
+                continue;
+            }
+            if (first_window < 0) {
+                first_window = (int)result->worst_window[i];
+            } else if (result->worst_window[i] != (uint32_t)first_window) {
+                mismatch = true;
+            }
+        }
+        if (mismatch) {
+            window_bonus = 2e5;
+        }
     }
 
-    double cycle_term =
-        fabs((double)result->worst_cycles[0] - (double)result->worst_cycles[1]) +
-        fabs((double)result->worst_cycles[0] - (double)result->worst_cycles[2]) +
-        fabs((double)result->worst_cycles[1] - (double)result->worst_cycles[2]);
-
-    double d_timing = cycle_term + window_bonus;
+    double d_timing = timing_ns_term + window_bonus;
 
     return (RL_ALPHA * d_semantic) + (RL_BETA * d_timing) + (RL_DELTA * d_fault);
 }
 
-double rl_compute_combined_reward(const triple_result_t *result, const wave_diff_summary_t *wave_summary) {
-    double reward = rl_compute_digital_divergence(result);
+double rl_compute_combined_reward(const triple_result_t *result, const wave_diff_summary_t *wave_summary, int skip_board) {
+    double reward = rl_compute_digital_divergence(result, skip_board);
     if (wave_summary && wave_summary->valid) {
         reward += RL_GAMMA * wave_summary->grand_total;
     }
@@ -135,11 +157,30 @@ int rl_choose_ucb_arm(rl_arm_t *arms, int arm_count) {
         }
     }
 
+    /*
+     * Classic UCB1's exploration bonus assumes rewards normalized to roughly
+     * [0,1]; this system's rewards are raw divergence magnitudes, routinely
+     * in the hundreds of thousands. Left unscaled, the bonus is negligible
+     * next to mean_reward and the bandit degenerates into "whichever arm
+     * got a lucky reward on its first pull, forever" - it stops exploring
+     * in practice after the initial one-pull-per-arm round. Scale the bonus
+     * to the same order of magnitude as the rewards actually being seen,
+     * using the arms' own observed means as that scale reference.
+     */
+    double reward_scale = 0.0;
+    for (int i = 0; i < arm_count; ++i) {
+        reward_scale += fabs(arms[i].mean_reward);
+    }
+    reward_scale /= (double)arm_count;
+    if (reward_scale < 1.0) {
+        reward_scale = 1.0;
+    }
+
     double best_value = -1e300;
     int best_index = 0;
 
     for (int i = 0; i < arm_count; ++i) {
-        double bonus = sqrt(2.0 * log((double)total_pulls) / (double)arms[i].pulls);
+        double bonus = reward_scale * sqrt(2.0 * log((double)total_pulls) / (double)arms[i].pulls);
         double value = arms[i].mean_reward + bonus;
         if (value > best_value) {
             best_value = value;
@@ -238,7 +279,7 @@ static void rl_results_open(const char *path) {
                 "iteration,seed,steps,arm_steps,pulls,mean_reward,digital,reward,"
                 "score0,score1,score2,flags0,flags1,flags2,"
                 "worst_window0,worst_window1,worst_window2,"
-                "worst_cycles0,worst_cycles1,worst_cycles2,"
+                "worst_ns0,worst_ns1,worst_ns2,"
                 "wave_valid,wave_grand_total\n");
         fflush(g_results_file);
     }
@@ -268,7 +309,7 @@ static void rl_results_write_row(uint64_t iteration,
             result->score[0], result->score[1], result->score[2],
             result->flags[0], result->flags[1], result->flags[2],
             result->worst_window[0], result->worst_window[1], result->worst_window[2],
-            result->worst_cycles[0], result->worst_cycles[1], result->worst_cycles[2],
+            result->worst_ns[0], result->worst_ns[1], result->worst_ns[2],
             wave_summary ? (int)wave_summary->valid : 0,
             wave_summary ? wave_summary->grand_total : 0.0);
     fflush(g_results_file);
@@ -362,11 +403,20 @@ int rl_mode_loop(const char *com_port,
         die("SEED_END must be >= SEED_START");
     }
 
-    static const rl_run_options_t default_options = {0, NULL, NULL, 0};
+    static const rl_run_options_t default_options = {0, NULL, NULL, 0, -1, 0};
     if (!options) {
         options = &default_options;
     }
     int checkpoint_interval = options->checkpoint_interval > 0 ? options->checkpoint_interval : 20;
+
+    if (options->skip_board >= 0 && options->skip_board < RL_BOARD_COUNT) {
+        rl_log_message(RL_LOG_INFO,
+                       "Board %d excluded for this session - running/comparing the remaining boards only",
+                       options->skip_board);
+    }
+    if (options->board_delay_ms > 0) {
+        rl_log_message(RL_LOG_INFO, "Inter-board delay: %d ms before addressing each board", options->board_delay_ms);
+    }
 
     serial_t serial = serial_open(com_port);
 
@@ -405,6 +455,16 @@ int rl_mode_loop(const char *com_port,
         }
 
         for (int b = 0; b < RL_BOARD_COUNT; ++b) {
+            if (b == options->skip_board) {
+                result.done[b] = true;
+                result.ok = result.done[0] && result.done[1] && result.done[2];
+                continue;
+            }
+
+            if (options->board_delay_ms > 0) {
+                Sleep((DWORD)options->board_delay_ms);
+            }
+
             serial_send_run(&serial, b, seed, steps);
 
             while (true) {
@@ -485,8 +545,8 @@ int rl_mode_loop(const char *com_port,
             waveform_capture_set_free(&capture);
         }
 
-        double digital = rl_compute_digital_divergence(&result);
-        double reward = rl_compute_combined_reward(&result, wave_summary_ptr);
+        double digital = rl_compute_digital_divergence(&result, options->skip_board);
+        double reward = rl_compute_combined_reward(&result, wave_summary_ptr, options->skip_board);
         rl_update_arm(&arms[arm_index], reward);
 
         rl_log_message(RL_LOG_INFO,

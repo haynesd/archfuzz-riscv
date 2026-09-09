@@ -49,7 +49,14 @@ static void print_usage_and_exit(void) {
         "  --results <FILE>            append one CSV row per iteration to FILE\n"
         "  --checkpoint <FILE>         persist/restore UCB bandit state to FILE so a long\n"
         "                               campaign can resume after being interrupted\n"
-        "  --checkpoint-interval <N>   iterations between checkpoint writes (default 20)\n\n"
+        "  --checkpoint-interval <N>   iterations between checkpoint writes (default 20)\n"
+        "  --skip-board <N>            exclude board N (0/1/2) from this session - not run,\n"
+        "                              not compared - so the remaining boards can still be\n"
+        "                              fuzzed/compared while board N is being debugged\n"
+        "  --board-delay-ms <N>        pause N ms before addressing each board within an\n"
+        "                              iteration - diagnostic for testing whether a link is\n"
+        "                              being disturbed by insufficient settling time after\n"
+        "                              the previous board's activity (default 0, no delay)\n\n"
         "Examples:\n"
         "  rl_host.exe ping COM5 0\n"
         "  rl_host.exe run1 COM5 0 12345 256\n"
@@ -66,6 +73,7 @@ int main(int argc, char **argv) {
 
     rl_run_options_t options;
     memset(&options, 0, sizeof(options));
+    options.skip_board = -1;
 
     while (argi < argc) {
         if (strcmp(argv[argi], "--debug") == 0) {
@@ -110,6 +118,22 @@ int main(int argc, char **argv) {
                 print_usage_and_exit();
             }
             options.checkpoint_interval = parse_int_decimal(argv[argi + 1], "CHECKPOINT_INTERVAL");
+            argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "--skip-board") == 0) {
+            if (argi + 1 >= argc) {
+                print_usage_and_exit();
+            }
+            options.skip_board = parse_board_index(argv[argi + 1]);
+            argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "--board-delay-ms") == 0) {
+            if (argi + 1 >= argc) {
+                print_usage_and_exit();
+            }
+            options.board_delay_ms = parse_int_decimal(argv[argi + 1], "BOARD_DELAY_MS");
             argi += 2;
             continue;
         }
