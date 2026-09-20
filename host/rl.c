@@ -450,8 +450,9 @@ int rl_mode_loop(const char *com_port,
         bool any_timeout = false;
         bool any_parse_error = false;
 
+        rigol_session_t *rigol_session = NULL;
         if (rigol && rigol->enabled) {
-            rigol_arm_single_capture(rigol);
+            rigol_session = rigol_arm_single_capture(rigol);
         }
 
         for (int b = 0; b < RL_BOARD_COUNT; ++b) {
@@ -493,6 +494,7 @@ int rl_mode_loop(const char *com_port,
         }
 
         if (any_timeout || any_parse_error || !result.ok) {
+            rigol_session_abandon(rigol_session);
             rl_log_message(RL_LOG_WARN,
                            "iter=%" PRIu64 " seed=%u steps=%d skipped",
                            iteration,
@@ -506,8 +508,8 @@ int rl_mode_loop(const char *com_port,
         memset(&wave_summary, 0, sizeof(wave_summary));
         wave_diff_summary_t *wave_summary_ptr = NULL;
 
-        if (rigol && rigol->enabled) {
-            waveform_capture_set_t capture = rigol_capture_scope_set(rigol);
+        if (rigol_session) {
+            waveform_capture_set_t capture = rigol_capture_scope_set(rigol_session);
             waveform_t aligned[RL_BOARD_COUNT];
             memset(aligned, 0, sizeof(aligned));
 

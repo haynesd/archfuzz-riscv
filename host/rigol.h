@@ -58,22 +58,51 @@ void rigol_net_cleanup(void);
 
 /*
 -------------------------------------------------------------------------------
+rigol_session_t
+-------------------------------------------------------------------------------
+Opaque handle for one held-open scope connection, spanning arm -> board
+activity -> read. The scope's SCPI/LAN server appears to cancel a pending
+single-shot trigger arm if the TCP connection that armed it is closed before
+the result is read back, so the same connection used to send :SING must stay
+open through the FPGA/board sequence and into the eventual capture read.
+-------------------------------------------------------------------------------
+*/
+typedef struct rigol_session rigol_session_t;
+
+/*
+-------------------------------------------------------------------------------
 rigol_arm_single_capture
 -------------------------------------------------------------------------------
 Arms the scope for one single-shot acquisition before the FPGA sequence begins.
 This is useful when the FPGA trigger pulse should define the captured record.
+
+Returns an open session to pass to rigol_capture_scope_set() (or
+rigol_session_abandon() if the capture ends up not being needed), or NULL if
+config is disabled.
 -------------------------------------------------------------------------------
 */
-void rigol_arm_single_capture(const rigol_config_t *config);
+rigol_session_t *rigol_arm_single_capture(const rigol_config_t *config);
 
 /*
 -------------------------------------------------------------------------------
 rigol_capture_scope_set
 -------------------------------------------------------------------------------
 Reads CH1-CH4 from the scope after an experiment completes and returns the full
-synchronized capture set.
+synchronized capture set. Consumes (closes and frees) the session regardless
+of outcome; the pointer must not be reused afterward.
 -------------------------------------------------------------------------------
 */
-waveform_capture_set_t rigol_capture_scope_set(const rigol_config_t *config);
+waveform_capture_set_t rigol_capture_scope_set(rigol_session_t *session);
+
+/*
+-------------------------------------------------------------------------------
+rigol_session_abandon
+-------------------------------------------------------------------------------
+Closes and frees a session returned by rigol_arm_single_capture() without
+performing a capture, e.g. when the board round that would have defined the
+capture window was skipped or failed. Safe to call with NULL.
+-------------------------------------------------------------------------------
+*/
+void rigol_session_abandon(rigol_session_t *session);
 
 #endif

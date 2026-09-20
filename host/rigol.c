@@ -2,6 +2,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -246,6 +247,53 @@ static double rigol_sample_to_volts(uint8_t raw, const rigol_preamble_t *preambl
     return (((double)raw) - (double)preamble->yref - preamble->yorig) * preamble->yincr;
 }
 
+/*
+ * Determines which 1-indexed sample number in the scope's internal
+ * acquisition memory corresponds to the trigger point (t=0), by taking a
+ * throwaway preamble reading with :WAV:STAR pinned to 1 so xorigin reports
+ * the timestamp of the very first memory sample. Without this, callers have
+ * no way to aim :WAV:STAR/:WAV:STOP at the trigger - the scope's default
+ * window (samples 1-1200) reads from the start of memory, which is nowhere
+ * near the trigger once memory depth exceeds a few thousand points.
+ */
+static long rigol_compute_trigger_index(rigol_socket_t sock, const char *reference_channel, long *out_points) {
+    char cmd[128];
+    char line[RIGOL_MAX_LINE];
+
+    if (out_points) {
+        *out_points = 1200;
+    }
+
+    snprintf(cmd, sizeof(cmd), ":WAV:SOUR %s", reference_channel);
+    rigol_scpi_write(sock, cmd);
+    rigol_scpi_write(sock, ":WAV:MODE RAW");
+    rigol_scpi_write(sock, ":WAV:FORM BYTE");
+    rigol_scpi_write(sock, ":WAV:STAR 1");
+    rigol_scpi_write(sock, ":WAV:STOP 1200");
+    rigol_scpi_query(sock, ":WAV:PRE?", line, sizeof(line));
+
+    rigol_preamble_t preamble = rigol_parse_preamble(line);
+    if (out_points) {
+        *out_points = preamble.points;
+    }
+    if (preamble.xincr <= 0.0) {
+        return 1;
+    }
+
+    /* preamble.xorig is the timestamp of memory sample #1 (STAR was pinned to
+       1 above); the trigger sits at t=0, so solve for the 1-indexed sample
+       number whose time is closest to zero. */
+    double idx0 = 1.0 - preamble.xorig / preamble.xincr;
+    long trig_index = (long)(idx0 + 0.5);
+    if (trig_index < 1) {
+        trig_index = 1;
+    }
+    if (preamble.points > 0 && trig_index > preamble.points) {
+        trig_index = preamble.points;
+    }
+    return trig_index;
+}
+
 static waveform_t rigol_capture_channel_on_socket(rigol_socket_t sock, const char *channel) {
     char line[RIGOL_MAX_LINE];
     char cmd[128];
@@ -284,17 +332,23 @@ static waveform_t rigol_capture_channel_on_socket(rigol_socket_t sock, const cha
 
     free(raw);
     rl_log_message(RL_LOG_INFO,
-                   "Captured %s: samples=%zu dt=%.12e energy=%.12e",
+                   "Captured %s: samples=%zu dt=%.12e energy=%.12e peak=%.6f V",
                    channel,
                    wave.sample_count,
                    wave.dt_s,
-                   wave.metrics.energy_proxy);
+                   wave.metrics.energy_proxy,
+                   wave.metrics.peak_abs);
     return wave;
 }
 
-void rigol_arm_single_capture(const rigol_config_t *config) {
+struct rigol_session {
+    rigol_socket_t sock;
+    const rigol_config_t *config;
+};
+
+rigol_session_t *rigol_arm_single_capture(const rigol_config_t *config) {
     if (!config || !config->enabled) {
-        return;
+        return NULL;
     }
 
     rigol_socket_t sock = rigol_tcp_connect(config->scope_ip, config->scope_port);
@@ -314,28 +368,112 @@ void rigol_arm_single_capture(const rigol_config_t *config) {
         rigol_scpi_write(sock, cmd);
     }
 
+    /*
+     * A single-shot acquisition leaves the scope in STOP once it completes.
+     * Sending :SING again while it is still sitting in STOP was observed to
+     * be silently ignored - every subsequent iteration just kept re-serving
+     * the one acquisition captured way back before this state was ever
+     * reached, no matter how many :SING commands followed. :RUN is what
+     * actually gets it out of STOP, but firing :RUN immediately followed by
+     * :SING with no gap doesn't reliably work either (that transition isn't
+     * instantaneous) - so :RUN is sent, then :TRIG:STATUS? is polled until
+     * it actually reports something other than STOP, and only then is
+     * :SING sent to arm the next capture.
+     */
     rigol_scpi_write(sock, ":RUN");
+    {
+        char status[RIGOL_MAX_LINE];
+        int attempt;
+        for (attempt = 0; attempt < 50; ++attempt) {
+            rigol_scpi_query(sock, ":TRIG:STATUS?", status, sizeof(status));
+            if (strncmp(status, "STOP", 4) != 0) {
+                break;
+            }
+            Sleep(20);
+        }
+        if (attempt == 50) {
+            rl_log_message(RL_LOG_WARN, "Scope still reports STOP after :RUN; arming single-shot anyway");
+        }
+    }
     rigol_scpi_write(sock, ":SING");
-    RIGOL_CLOSESOCK(sock);
 
     rl_log_message(RL_LOG_INFO, "Rigol scope armed for single-shot acquisition");
+
+    /*
+     * Deliberately keep this connection open and hand it back to the caller
+     * rather than closing it here: closing the TCP session right after
+     * arming :SING and reopening a fresh one later to read the result was
+     * observed to leave the scope permanently stuck re-serving one stale
+     * acquisition, capture after capture, regardless of trigger source/level/
+     * wiring - i.e. the arm silently never survives a connection close. A
+     * session held open through the FPGA/board sequence and into the
+     * eventual :STOP + read does not have this problem.
+     */
+    rigol_session_t *session = (rigol_session_t *)malloc(sizeof(rigol_session_t));
+    if (!session) {
+        RIGOL_CLOSESOCK(sock);
+        die("malloc failed for rigol session");
+    }
+    session->sock = sock;
+    session->config = config;
+    return session;
 }
 
-waveform_capture_set_t rigol_capture_scope_set(const rigol_config_t *config) {
+void rigol_session_abandon(rigol_session_t *session) {
+    if (!session) {
+        return;
+    }
+    RIGOL_CLOSESOCK(session->sock);
+    free(session);
+}
+
+waveform_capture_set_t rigol_capture_scope_set(rigol_session_t *session) {
     waveform_capture_set_t capture;
     memset(&capture, 0, sizeof(capture));
 
-    if (!config || !config->enabled) {
+    if (!session) {
         return capture;
     }
 
-    rigol_socket_t sock = rigol_tcp_connect(config->scope_ip, config->scope_port);
-    char idn[RIGOL_MAX_LINE];
-
-    rigol_scpi_query(sock, "*IDN?", idn, sizeof(idn));
-    rl_log_message(RL_LOG_INFO, "Rigol IDN: %s", idn);
+    rigol_socket_t sock = session->sock;
+    const rigol_config_t *config = session->config;
 
     rigol_scpi_write(sock, ":STOP");
+
+    long total_points = 1200;
+    long trig_index = rigol_compute_trigger_index(sock, config->trigger_channel, &total_points);
+
+    /* Bracket the trigger sample with the caller's requested pre/post margin
+       plus a little slack for real-world trigger jitter/propagation delay,
+       then pin :WAV:STAR/:WAV:STOP to that range so every channel's
+       :WAV:DATA? below actually reads memory around the trigger instead of
+       the scope's default (start-of-memory) window. */
+    long slack = 200;
+    long pre = (long)config->pre_trigger_samples + slack;
+    long post = (long)config->window_samples + slack;
+
+    long star = trig_index - pre;
+    if (star < 1) {
+        star = 1;
+    }
+    long stop = trig_index + post;
+    if (total_points > 0 && stop > total_points) {
+        stop = total_points;
+    }
+    if (stop < star) {
+        stop = star;
+    }
+
+    char star_cmd[64];
+    char stop_cmd[64];
+    snprintf(star_cmd, sizeof(star_cmd), ":WAV:STAR %ld", star);
+    snprintf(stop_cmd, sizeof(stop_cmd), ":WAV:STOP %ld", stop);
+    rigol_scpi_write(sock, star_cmd);
+    rigol_scpi_write(sock, stop_cmd);
+
+    rl_log_message(RL_LOG_INFO,
+                   "Waveform capture window: trigger_index=%ld star=%ld stop=%ld (of %ld points)",
+                   trig_index, star, stop, total_points);
 
     for (int i = 0; i < RL_BOARD_COUNT; ++i) {
         capture.power[i] = rigol_capture_channel_on_socket(sock, config->power_channels[i]);
@@ -344,5 +482,6 @@ waveform_capture_set_t rigol_capture_scope_set(const rigol_config_t *config) {
     capture.valid = capture.trigger.metrics.valid;
 
     RIGOL_CLOSESOCK(sock);
+    free(session);
     return capture;
 }
