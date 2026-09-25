@@ -24,8 +24,52 @@ Supported commands:
        Output: PONG\n
 
   2) RUN
-       Input : RUN <seed_dec> <steps_dec>\n
-       Output: DONE <seed_dec> <score_dec> <flags_dec> <worst_window_dec> <worst_ns_dec>\n
+       Input : RUN <seed_dec> <steps_dec> [diag_mode_dec]\n
+       Output: DONE <seed_dec> <checksum_dec> <total_ns_dec> <flags_dec> <worst_window_dec> <worst_ns_dec>\n
+
+checksum and total_ns are reported as separate fields (not combined) so the
+host can tell architectural/correctness divergence (checksum) apart from
+pure clock-speed/timing divergence (total_ns) instead of conflating both
+into one number.
+
+diag_mode is an optional third field, defaulting to 0 (the normal, full
+workload - identical to always omitting it) when absent, for manual
+bisection of a cross-board checksum divergence:
+  0 = full workload (default): ALU + memory + AMO(1/32 steps) + branch(1/1024 steps)
+  1 = ALU-only: only the unconditional multiply/shift/rotate mixing lines run;
+      memory section, AMO block, and branch perturbation are all skipped
+  2 = ALU + memory, no AMO/branch: adds the unconditional load/modify/store
+      memory section back on top of mode 1
+  3 = ALU + memory + AMO, no branch: adds the AMO block (1/32 steps) back on
+      top of mode 2, still without the branch perturbation, to tell AMO and
+      branch-perturbation apart as the last two candidates once modes 1/2
+      have both matched across boards
+Only rl_host.exe's run1 mode can send diag_mode != 0; the rl/rl_scope
+bandit loop always sends 0 (or omits it), so a live campaign's results are
+unaffected by this field's existence.
+
+Investigation note (2026-09-25): this tooling was built to bisect a
+cross-board checksum divergence where board 0 disagreed with boards 1/2 on
+essentially every run in a multi-day campaign (overnight_divergence.csv,
+944782 rows, 100% divergence). Modes 1/2/3 each matched cleanly across all
+three boards for known-divergent (seed, steps) pairs, which was the first
+sign something was off - a real per-instruction architectural difference
+should have shown up in at least one isolated mode. A fresh, carefully
+verified redeploy to all three boards (confirmed via systemd's
+"active (running) since Xms ago" on every board, not just a successful scp)
+then reproduced 0 divergence across 347 fresh iterations, mode 0 included,
+on the exact (seed, steps) pairs that had previously diverged 100% of the
+time. Conclusion: the original divergence was board 0 silently running
+stale/different code during the campaign (the same class of bug as the
+ExecStart path mismatch caught earlier), not a genuine SpacemiT K1 defect.
+The diag_mode infrastructure is kept because it's useful diagnostic tooling
+in general, not because there's a currently open divergence to explain.
+
+flags is 0 for a clean run, or a bitwise-OR of FLAG_SIGILL (0x1) /
+FLAG_SIGSEGV (0x2) / FLAG_SIGBUS (0x4) / FLAG_SIGFPE (0x8) if the board
+raised a genuine hardware fault partway through the workload - in that case
+checksum/total_ns/worst_window/worst_ns are all 0 since the run did not
+complete. See the "Fault Detection" section below for why/how.
 
 The RUN command executes a deterministic synthetic workload driven by the seed.
 The workload is divided into fixed-size windows so timing hotspots can be
@@ -137,8 +181,8 @@ Example console output:
   [TX] PONG\n
   [RX] RUN 12345 256\n
   [RUN] seed=12345 steps=256
-  [DONE] seed=12345 score=987654321 flags=0 worst_window=5 worst_ns=1842
-  [TX] DONE 12345 987654321 0 5 1842\n
+  [DONE] seed=12345 checksum=987654321 total_ns=48213 flags=0 worst_window=5 worst_ns=1842
+  [TX] DONE 12345 987654321 48213 0 5 1842\n
 
 BUILD (on-board)
 -------------------------------------------------------------------------------
@@ -162,6 +206,8 @@ Replace /dev/ttyS0 with the UART device connected to the FPGA.
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -334,8 +380,72 @@ static inline uint64_t monotonic_ticks_u64(void) {
 }
 
 //============================================================================
+//   Fault Detection
+//============================================================================
+//   The workload only ever performs bounds-checked memory access and valid
+//   instruction sequences, so under correct CPU/memory-subsystem behavior it
+//   should never raise a hardware fault. If a board's silicon, cache
+//   coherency, or atomic-unit implementation has a genuine defect, the most
+//   likely externally-visible symptom is the kernel delivering SIGILL
+//   (illegal/unsupported instruction - e.g. a botched AMO decode), SIGBUS
+//   (misaligned or otherwise invalid access the bus can't service), SIGSEGV
+//   (an access the MMU/cache path resolves to the wrong or a protected
+//   page), or SIGFPE (an arithmetic trap).
+//
+//   Without handling these, the runner process would simply be killed by
+//   the kernel: the host sees a UART timeout with zero diagnostic
+//   information about what happened, and systemd silently respawns the
+//   process, losing the finding entirely. Instead, a handler here records
+//   which fault occurred and uses sigsetjmp/siglongjmp to unwind straight
+//   back to the top of the current RUN's handling, so the runner reports a
+//   DONE line with the fault flag set and keeps serving the UART.
+//
+//   Caveat: process/memory state after a genuine SIGSEGV/SIGBUS is not
+//   strictly well-defined by the C standard. Continuing in-process (rather
+//   than exiting and letting systemd restart) is a deliberate choice for
+//   this research tool - it keeps a long unattended campaign moving and
+//   preserves UART framing - but any fault-flagged result should be treated
+//   as a strong finding to manually reproduce in isolation, not blindly
+//   trusted alongside ordinary runs.
+//============================================================================
+
+#define FLAG_SIGILL  (1u << 0)
+#define FLAG_SIGSEGV (1u << 1)
+#define FLAG_SIGBUS  (1u << 2)
+#define FLAG_SIGFPE  (1u << 3)
+
+static sigjmp_buf g_fault_jmp;
+static volatile sig_atomic_t g_fault_flags;
+
+static void fault_signal_handler(int sig) {
+    switch (sig) {
+        case SIGILL:  g_fault_flags |= FLAG_SIGILL;  break;
+        case SIGSEGV: g_fault_flags |= FLAG_SIGSEGV; break;
+        case SIGBUS:  g_fault_flags |= FLAG_SIGBUS;  break;
+        case SIGFPE:  g_fault_flags |= FLAG_SIGFPE;  break;
+        default: break;
+    }
+    siglongjmp(g_fault_jmp, 1);
+}
+
+static void install_fault_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = fault_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* no SA_RESTART: readline_uart/write_all already retry on EINTR */
+
+    int sigs[] = { SIGILL, SIGSEGV, SIGBUS, SIGFPE };
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); ++i) {
+        if (sigaction(sigs[i], &sa, NULL) != 0) {
+            die("sigaction");
+        }
+    }
+}
+
+//============================================================================
 //   RISC-V AMO Helpers
-//============================================================================ 
+//============================================================================
 
 /* Arithmetic atomic update */
 static inline uint32_t amoadd_w(volatile uint32_t *p, uint32_t val) {
@@ -501,9 +611,21 @@ typedef struct {
      - total_ns      : total run time in nanoseconds (clock_gettime(CLOCK_MONOTONIC)) for the entire workload
      - worst_window  : which timing window was slowest
      - worst_ns      : how slow that worst window was, in nanoseconds
-     - flags         : reserved for future anomaly markers
+     - flags         : 0 if the run completed cleanly; otherwise a bitwise-OR
+                       of FLAG_SIGILL/FLAG_SIGSEGV/FLAG_SIGBUS/FLAG_SIGFPE
+                       recorded by fault_signal_handler() when the caller's
+                       sigsetjmp recovery point is hit mid-run (see "Fault
+                       Detection" above) - this function itself never sets a
+                       fault bit, since by the time it can return normally
+                       the run genuinely completed without one.
+
+   diag_mode selects which sections of the per-step body actually execute,
+   for manually bisecting a cross-board checksum divergence down to a
+   specific construct (see the diag_mode doc at the top of this file for the
+   0/1/2 meanings). It defaults to 0, which is byte-for-byte the original,
+   always-on behavior this function had before diag_mode existed.
    ---------------------------------------------------------------------------- */
-static run_result_t workload_windowed(uint32_t seed, int steps) {
+static run_result_t workload_windowed(uint32_t seed, int steps, int diag_mode) {
     run_result_t rr;                                  /* Create the result struct that will hold checksum, timing, and window info. */
     memset(&rr, 0, sizeof(rr));                      /* Start with all result fields cleared so defaults are known and safe. */
 
@@ -514,6 +636,21 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
     if (n_windows > MAX_WINDOWS) {                   /* Guard against excessive window counts so the workload stays inside the designed analysis limits. */
         n_windows = MAX_WINDOWS;                     /* Limit the number of windows to the maximum supported value. */
     }
+
+    /*
+     * mem[] is a static array reused across every RUN command this process
+     * ever handles, and the warm-up/main loops below only ever XOR into it -
+     * without resetting it here first, this run's result would depend on
+     * the accumulated history of every prior seed this runner has executed
+     * since it started, not just on (seed, steps) as intended. Confirmed
+     * experimentally: five back-to-back runs of the same seed on the same
+     * board produced three different checksums before this fix. Resetting
+     * to a fixed baseline here (before total_start is captured below) makes
+     * checksum a pure, reproducible function of (seed, steps), and costs
+     * nothing in the measured timing since it happens before the clock
+     * starts.
+     */
+    memset(mem, 0, sizeof(mem));
 
     for (int i = 0; i < 1024; i++) {                 /* Run a deterministic warm-up loop to initialize scratch memory into a seed-dependent state before timing the main workload. */
         uint32_t r = xorshift32(&st);                /* Advance the deterministic pseudo-random generator to get the next workload-driving value. */
@@ -539,7 +676,8 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
             acc += (acc << 7) ^ (r >> 3);            /* Combine shifts, XOR, and addition to create more varied arithmetic pressure and data dependencies. */
             acc = (acc << 3) | (acc >> 29);          /* Perform a rotate-like operation so bits move across positions and the accumulator remains highly mixed. */
 
-            /* Normal memory section */
+            /* Normal memory section - skipped when diag_mode == 1 (ALU-only bisection) */
+            if (diag_mode != 1) {
             uint32_t idx = (r ^ acc) % MEM_WORDS;    /* Choose a memory index based on both current pseudo-random state and accumulator state, making accesses data-dependent and less predictable. */
             uint32_t v   = mem[idx];                 /* Load the current value from the selected scratch-memory location. */
 
@@ -549,8 +687,10 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
 
             acc ^= mem[(idx + (acc & 1023u)) % MEM_WORDS]; /* Perform a second dependent memory read using both the current index and low bits of the accumulator, making later behavior depend on earlier state and memory contents. */
 
-            /* Atomic stress section using explicit RISC-V AMO operations */
-            if ((r & 0x1Fu) == 0u) {                 /* Only execute the atomic stress block occasionally so it influences the workload without completely dominating every step. */
+            /* Atomic stress section using explicit RISC-V AMO operations - skipped
+               entirely for diag_mode 1 and 2 (both bisect AMO/branch out); included
+               for diag_mode 0 and 3 */
+            if ((diag_mode == 0 || diag_mode == 3) && (r & 0x1Fu) == 0u) { /* Only execute the atomic stress block occasionally so it influences the workload without completely dominating every step. */
                 volatile uint32_t *aptr = &mem[(idx + 17u) % MEM_WORDS]; /* Select a nearby scratch-memory word for atomic operations; mark the pointer volatile so the explicit AMO memory side effects are preserved as intended. */
 
                 uint32_t old_add  = amoadd_w(aptr, (r | 1u));           /* Atomically add a pseudo-random odd value and capture the old memory value; this stresses arithmetic AMO behavior. */
@@ -575,10 +715,11 @@ static run_result_t workload_windowed(uint32_t seed, int steps) {
                 acc ^= old_umax;                        /* Fold the old result of the unsigned max AMO into the accumulator. */
             }
 
-            /* Occasional branch-like perturbation */
-            if ((r & 0x3FFu) == 0x155u) {              /* Occasionally take an alternate path based on the pseudo-random pattern so the control-flow profile is not completely uniform. */
+            /* Occasional branch-like perturbation - skipped for diag_mode 1/2 along with AMO above */
+            if (diag_mode == 0 && (r & 0x3FFu) == 0x155u) { /* Occasionally take an alternate path based on the pseudo-random pattern so the control-flow profile is not completely uniform. */
                 acc ^= 0xDEADBEEFu;                    /* Perturb the accumulator strongly when that rare condition is met, making branch timing and path differences visible in results. */
             }
+            } /* end: if (diag_mode != 1) - normal memory section */
         }
 
         uint64_t w1 = monotonic_ticks_u64();          /* Record the end time of the current window. */
@@ -613,6 +754,8 @@ int main(int argc, char **argv) {
     int fd = open_uart(argv[1]);
     char line[256];
 
+    install_fault_handlers();
+
     printf("[INFO] runner started on %s\n", argv[1]);
     fflush(stdout);
 
@@ -630,14 +773,22 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* RUN command: RUN <seed_dec> <steps_dec>\n */
+        /* RUN command: RUN <seed_dec> <steps_dec> [diag_mode_dec]\n
+           diag_mode defaults to 0 (full workload) when the third field is
+           absent, which is the normal case for every existing caller. */
         unsigned seed = 0;
         int steps = 0;
+        int diag_mode = 0;
 
-        if (sscanf(line, "RUN %u %d", &seed, &steps) != 2) {
-            printf("[INFO] ignored unrecognized command\n");
-            fflush(stdout);
-            continue;
+        {
+            int parsed = sscanf(line, "RUN %u %d %d", &seed, &steps, &diag_mode);
+            if (parsed == 2) {
+                diag_mode = 0;
+            } else if (parsed != 3) {
+                printf("[INFO] ignored unrecognized command\n");
+                fflush(stdout);
+                continue;
+            }
         }
 
         if (steps < 1) {
@@ -648,19 +799,35 @@ int main(int argc, char **argv) {
             steps = WINDOW_SIZE * MAX_WINDOWS;
         }
 
-        printf("[RUN] seed=%u steps=%d\n", (uint32_t)seed, steps);
+        if (diag_mode < 0 || diag_mode > 3) {
+            diag_mode = 0;
+        }
+
+        printf("[RUN] seed=%u steps=%d diag_mode=%d\n", (uint32_t)seed, steps, diag_mode);
         fflush(stdout);
 
-        run_result_t rr = workload_windowed((uint32_t)seed, steps);
-
-        uint64_t score = rr.total_ns ^ (uint64_t)rr.checksum;
+        run_result_t rr;
+        g_fault_flags = 0;
+        if (sigsetjmp(g_fault_jmp, 1) != 0) {
+            /* Landed here via siglongjmp from fault_signal_handler(): the
+               workload below did not complete, so checksum/total_ns/
+               worst_window/worst_ns stay at their zeroed defaults and only
+               the fault flag(s) are meaningful for this result. */
+            memset(&rr, 0, sizeof(rr));
+            rr.flags = (uint32_t)g_fault_flags;
+            printf("[FAULT] seed=%u flags=0x%x\n", (uint32_t)seed, rr.flags);
+            fflush(stdout);
+        } else {
+            rr = workload_windowed((uint32_t)seed, steps, diag_mode);
+        }
 
         /* Human-readable local console summary */
         printf(
-            "[DONE] seed=%u score=%" PRIu64
+            "[DONE] seed=%u checksum=%u total_ns=%" PRIu64
             " flags=%u worst_window=%u worst_ns=%" PRIu64 "\n",
             (uint32_t)seed,
-            (uint64_t)score,
+            rr.checksum,
+            rr.total_ns,
             (uint32_t)rr.flags,
             rr.worst_window,
             rr.worst_ns
@@ -672,9 +839,10 @@ int main(int argc, char **argv) {
         snprintf(
             out,
             sizeof(out),
-            "DONE %u %" PRIu64 " %u %u %" PRIu64 "\n",
+            "DONE %u %u %" PRIu64 " %u %u %" PRIu64 "\n",
             (uint32_t)seed,
-            (uint64_t)score,
+            rr.checksum,
+            rr.total_ns,
             (uint32_t)rr.flags,
             rr.worst_window,
             rr.worst_ns

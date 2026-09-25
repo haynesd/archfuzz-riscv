@@ -131,6 +131,12 @@ void serial_send_run(serial_t *serial, int board_index, uint32_t seed, int steps
     serial_write_frame(serial, board_index, payload);
 }
 
+void serial_send_run_diag(serial_t *serial, int board_index, uint32_t seed, int steps, int diag_mode) {
+    char payload[128];
+    snprintf(payload, sizeof(payload), "RUN %u %d %d\n", seed, steps, diag_mode);
+    serial_write_frame(serial, board_index, payload);
+}
+
 /*
 -------------------------------------------------------------------------------
 serial_readline_internal

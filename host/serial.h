@@ -96,6 +96,26 @@ Parameters:
 void serial_send_run(serial_t *serial, int board_index, uint32_t seed, int steps);
 
 /*
+--------------------------------------------------------------------------------
+serial_send_run_diag
+--------------------------------------------------------------------------------
+Transmits a framed RUN command that also carries an explicit diag_mode field,
+for manually bisecting a cross-board checksum divergence with rl_mode_run1
+(see the diag_mode doc at the top of board/runner.c for the 0/1/2 meanings).
+Not used by the rl/rl_scope bandit loop, which always calls serial_send_run
+(diag_mode implicitly 0) so a live campaign's results are unaffected.
+
+Parameters:
+  serial      - open serial transport.
+  board_index - board number in the range [0, RL_BOARD_COUNT).
+  seed        - deterministic workload seed.
+  steps       - workload length or stress parameter.
+  diag_mode   - 0 (full workload), 1 (ALU-only), or 2 (ALU + memory, no AMO/branch).
+--------------------------------------------------------------------------------
+*/
+void serial_send_run_diag(serial_t *serial, int board_index, uint32_t seed, int steps, int diag_mode);
+
+/*
 -------------------------------------------------------------------------------
 serial_read_line
 -------------------------------------------------------------------------------

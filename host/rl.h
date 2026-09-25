@@ -33,12 +33,35 @@ triple_result_t
 -------------------------------------------------------------------------------
 Aggregates the architectural and waveform results for one seed/steps test case
 executed across all boards.
+
+checksum and total_ns are reported by board/runner.c as separate fields
+(rather than one XORed "score") specifically so architectural/correctness
+divergence (checksum) and pure clock-speed/timing divergence (total_ns) can
+be told apart instead of conflated into a single number - three boards
+running at different clock speeds will show total_ns differences on
+essentially every run regardless of whether the computed result was
+actually correct, so that term alone was never a reliable defect signal.
+
+flags is 0 for boards whose runner_c workload/runner.c completed cleanly,
+or a bitwise-OR of the board-side FLAG_SIGILL/FLAG_SIGSEGV/FLAG_SIGBUS/
+FLAG_SIGFPE bits (see board/runner.c) if the board's kernel delivered a
+genuine hardware fault signal partway through the workload - in that case
+that board's checksum/total_ns/worst_window/worst_ns are all 0, since the
+run did not complete.
+
+A cross-board checksum mismatch is a real, meaningful correctness-divergence
+signal - but treat it as a lead, not a conclusion, until the boards' running
+binaries are independently confirmed identical (see the diag_mode
+investigation note in board/runner.c for a case where an apparent 100%
+divergence across 944782 campaign rows turned out to be board 0 silently
+running stale code, not an architectural difference).
 -------------------------------------------------------------------------------
 */
 typedef struct {
     uint32_t seed;
     int steps;
-    uint64_t score[RL_BOARD_COUNT];
+    uint32_t checksum[RL_BOARD_COUNT];
+    uint64_t total_ns[RL_BOARD_COUNT]; /* wall-clock nanoseconds for the whole run; not a CPU cycle count */
     uint32_t flags[RL_BOARD_COUNT];
     uint32_t worst_window[RL_BOARD_COUNT];
     uint64_t worst_ns[RL_BOARD_COUNT]; /* wall-clock nanoseconds for the worst window; not a CPU cycle count */
@@ -203,12 +226,17 @@ Parameters:
   board_index - board to exercise.
   seed        - deterministic workload seed.
   steps       - workload length or stress parameter.
+  diag_mode   - 0 for the normal full workload, or 1/2 to bisect a cross-board
+                checksum divergence down to a specific construct (see the
+                diag_mode doc at the top of board/runner.c). Only this manual
+                single-run mode can send a nonzero diag_mode; the rl/rl_scope
+                bandit loop always runs diag_mode 0.
 
 Returns:
   Process-style status code.
 -------------------------------------------------------------------------------
 */
-int rl_mode_run1(const char *com_port, int board_index, uint32_t seed, int steps);
+int rl_mode_run1(const char *com_port, int board_index, uint32_t seed, int steps, int diag_mode);
 
 /*
 -------------------------------------------------------------------------------

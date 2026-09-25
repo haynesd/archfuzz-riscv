@@ -31,7 +31,7 @@ static void print_usage_and_exit(void) {
     die(
         "Usage:\n"
         "  rl_host.exe ping <COM_PORT> <BOARD>\n"
-        "  rl_host.exe run1 <COM_PORT> <BOARD> <SEED> <STEPS>\n"
+        "  rl_host.exe run1 <COM_PORT> <BOARD> <SEED> <STEPS> [DIAG_MODE]\n"
         "  rl_host.exe rl <COM_PORT> <SEED_START> <SEED_END>\n"
         "  rl_host.exe rl_scope <COM_PORT> <SEED_START> <SEED_END> <SCOPE_IP> <SCOPE_PORT> "
         "[PRE_TRIGGER_SAMPLES] [WINDOW_SAMPLES] [TRIGGER_THRESHOLD_V] [TIMEBASE_SCALE_S] [TIMEBASE_OFFSET_S]\n\n"
@@ -57,9 +57,16 @@ static void print_usage_and_exit(void) {
         "                              iteration - diagnostic for testing whether a link is\n"
         "                              being disturbed by insufficient settling time after\n"
         "                              the previous board's activity (default 0, no delay)\n\n"
+        "DIAG_MODE (run1 only, optional, default 0) - for manually bisecting a\n"
+        "cross-board checksum divergence down to a specific workload construct:\n"
+        "  0 = full workload (default): ALU + memory + AMO(1/32 steps) + branch(1/1024 steps)\n"
+        "  1 = ALU-only: multiply/shift/rotate mixing lines only, memory/AMO/branch skipped\n"
+        "  2 = ALU + memory, no AMO/branch\n"
+        "  3 = ALU + memory + AMO, no branch\n\n"
         "Examples:\n"
         "  rl_host.exe ping COM5 0\n"
         "  rl_host.exe run1 COM5 0 12345 256\n"
+        "  rl_host.exe run1 COM5 0 12345 4096 1\n"
         "  rl_host.exe rl COM5 16 65536\n"
         "  rl_host.exe --rng-seed 42 --results run1.csv rl COM5 16 65536\n"
         "  rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555\n"
@@ -152,13 +159,15 @@ int main(int argc, char **argv) {
         }
         rc = rl_mode_ping(argv[argi + 1], parse_board_index(argv[argi + 2]));
     } else if (strcmp(argv[argi], "run1") == 0) {
-        if (argc - argi != 5) {
+        if (argc - argi != 5 && argc - argi != 6) {
             print_usage_and_exit();
         }
+        int diag_mode = (argc - argi == 6) ? parse_int_decimal(argv[argi + 5], "DIAG_MODE") : 0;
         rc = rl_mode_run1(argv[argi + 1],
                           parse_board_index(argv[argi + 2]),
                           parse_u32_decimal(argv[argi + 3], "SEED"),
-                          parse_int_decimal(argv[argi + 4], "STEPS"));
+                          parse_int_decimal(argv[argi + 4], "STEPS"),
+                          diag_mode);
     } else if (strcmp(argv[argi], "rl") == 0) {
         if (argc - argi != 4) {
             print_usage_and_exit();

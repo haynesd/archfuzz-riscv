@@ -39,13 +39,21 @@ Named to match the formal reward function documented in README.md:
 Centralizing them here makes the mapping from the paper's formula to this
 implementation explicit and gives a single place to change for future
 ablation experiments. Values are chosen to reproduce the magnitudes used
-before this was split out (score/1000, +1e6 per fault, +2e5 window-location
+before this was split out (checksum/1000, +1e6 per fault, +2e5 window-location
 mismatch, wave divergence * 1000).
 
-Note: D_fault (delta term) is currently always 0 because board/runner.c never
-sets a nonzero flags value (its `flags` field is explicitly reserved/TBD).
-The wiring here is ready for fault detection to be added on-board; until
-then this term does not contribute to the reward.
+D_semantic is computed from checksum, not the old combined "score" field -
+board/runner.c now reports checksum and total_ns as separate DONE fields
+instead of XORing them together, so this term reflects actual
+architectural/correctness divergence rather than being polluted by
+clock-speed differences between boards (which alone would make it nonzero
+on nearly every run).
+
+D_fault (delta term) is driven by board/runner.c's on-board SIGILL/SIGSEGV/
+SIGBUS/SIGFPE handling: a board whose kernel delivers one of those signals
+mid-workload reports a nonzero flags value instead of crashing silently,
+and this term rewards that heavily (+1e6) since it is the strongest
+possible defect signal this system can produce.
 -------------------------------------------------------------------------------
 */
 #define RL_ALPHA 1.0    /* D_semantic weight */
@@ -55,9 +63,10 @@ then this term does not contribute to the reward.
 
 bool rl_parse_done_line(const char *line, int board_index, triple_result_t *result) {
     unsigned seed = 0;
+    unsigned checksum = 0;
+    unsigned long long total_ns = 0;
     unsigned flags = 0;
     unsigned worst_window = 0;
-    unsigned long long score = 0;
     unsigned long long worst_ns = 0;
 
     if (!line || !result || board_index < 0 || board_index >= RL_BOARD_COUNT) {
@@ -65,18 +74,20 @@ bool rl_parse_done_line(const char *line, int board_index, triple_result_t *resu
     }
 
     int matched = sscanf(line,
-                         "DONE %u %llu %u %u %llu",
+                         "DONE %u %u %llu %u %u %llu",
                          &seed,
-                         &score,
+                         &checksum,
+                         &total_ns,
                          &flags,
                          &worst_window,
                          &worst_ns);
-    if (matched != 5) {
+    if (matched != 6) {
         return false;
     }
 
     result->seed = seed;
-    result->score[board_index] = (uint64_t)score;
+    result->checksum[board_index] = checksum;
+    result->total_ns[board_index] = (uint64_t)total_ns;
     result->flags[board_index] = flags;
     result->worst_window[board_index] = worst_window;
     result->worst_ns[board_index] = (uint64_t)worst_ns;
@@ -97,7 +108,7 @@ double rl_compute_digital_divergence(const triple_result_t *result, int skip_boa
             if (j == skip_board) {
                 continue;
             }
-            d_semantic += fabs((double)result->score[i] - (double)result->score[j]);
+            d_semantic += fabs((double)result->checksum[i] - (double)result->checksum[j]);
             timing_ns_term += fabs((double)result->worst_ns[i] - (double)result->worst_ns[j]);
         }
     }
@@ -226,11 +237,15 @@ int rl_mode_ping(const char *com_port, int board_index) {
     }
 }
 
-int rl_mode_run1(const char *com_port, int board_index, uint32_t seed, int steps) {
+int rl_mode_run1(const char *com_port, int board_index, uint32_t seed, int steps, int diag_mode) {
     serial_t serial = serial_open(com_port);
     char line[512];
 
-    serial_send_run(&serial, board_index, seed, steps);
+    if (diag_mode != 0) {
+        serial_send_run_diag(&serial, board_index, seed, steps, diag_mode);
+    } else {
+        serial_send_run(&serial, board_index, seed, steps);
+    }
 
     while (true) {
         if (!rl_read_one_response(&serial, line, (int)sizeof(line))) {
@@ -277,7 +292,7 @@ static void rl_results_open(const char *path) {
     if (ftell(g_results_file) == 0) {
         fprintf(g_results_file,
                 "iteration,seed,steps,arm_steps,pulls,mean_reward,digital,reward,"
-                "score0,score1,score2,flags0,flags1,flags2,"
+                "checksum0,checksum1,checksum2,total_ns0,total_ns1,total_ns2,flags0,flags1,flags2,"
                 "worst_window0,worst_window1,worst_window2,"
                 "worst_ns0,worst_ns1,worst_ns2,"
                 "wave_valid,wave_grand_total\n");
@@ -301,12 +316,13 @@ static void rl_results_write_row(uint64_t iteration,
 
     fprintf(g_results_file,
             "%" PRIu64 ",%u,%d,%d,%" PRIu64 ",%.6f,%.6f,%.6f,"
-            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%u,%u,"
+            "%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%u,%u,"
             "%u,%u,%u,"
             "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
             "%d,%.6f\n",
             iteration, result->seed, result->steps, arm_steps, pulls, mean_reward, digital, reward,
-            result->score[0], result->score[1], result->score[2],
+            result->checksum[0], result->checksum[1], result->checksum[2],
+            result->total_ns[0], result->total_ns[1], result->total_ns[2],
             result->flags[0], result->flags[1], result->flags[2],
             result->worst_window[0], result->worst_window[1], result->worst_window[2],
             result->worst_ns[0], result->worst_ns[1], result->worst_ns[2],
