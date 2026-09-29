@@ -44,6 +44,48 @@ bisection of a cross-board checksum divergence:
       top of mode 2, still without the branch perturbation, to tell AMO and
       branch-perturbation apart as the last two candidates once modes 1/2
       have both matched across boards
+  4 = FP-only: skips ALU/memory/AMO/branch entirely and runs only the
+      floating-point section (denormals, a genuine runtime-computed NaN,
+      and a rounding-tie-sensitive value, all double-precision). Manual
+      bisection tool for evaluating whether the RV64GC D extension is
+      worth promoting into a live bandit arm - see the FP section's own
+      comment below for why each construct was chosen. Isolated the same
+      way mode 1 isolates ALU, rather than layered on top of the others,
+      so a divergence here has one unambiguous cause.
+      (2026-09-29: 3002 unique seeds tested across all 3 boards, 0
+      checksum mismatches, 0 faults - no divergence found in this
+      construct set.)
+  5 = misaligned-access + CSR-read probe: skips ALU/memory/AMO/branch/FP
+      entirely. Two genuinely untested, well-known RISC-V divergence
+      points: (a) a deliberately misaligned 16-bit and 32-bit load/store
+      into mem[] - the base ISA does not require hardware support for
+      misaligned access, so a core may handle it natively or trap for the
+      kernel to emulate; (b) an rdcycle/rdtime/rdinstret read, which only
+      succeeds in U-mode if the kernel's mcounteren/scounteren CSR
+      permits it - a per-kernel-build config choice, not an ISA
+      guarantee, and each of the 3 boards runs a different distro/kernel
+      build. A divergence in (b) surfaces as FLAG_SIGILL on one board and
+      not the others; see the diag_mode==5 section's own comment for why
+      the CSR values themselves are never folded into the checksum.
+      (2026-09-29: mode 5 hit FLAG_SIGILL on 8/8 seeds on boards 0 and 1,
+      flags=0 with a real checksum on board 2, every time - modes 6/7
+      below exist to confirm which of (a)/(b) is actually responsible.)
+  6 = misaligned-access only: the (a) construct from mode 5 in isolation,
+      CSR probe skipped.
+      (2026-09-29: 8/8 seeds, all 3 boards match, 0 faults - misaligned
+      access is NOT the cause; handled identically everywhere, whether by
+      native hardware support or transparent kernel emulation.)
+  7 = CSR-read only: the (b) construct from mode 5 in isolation,
+      misaligned access skipped.
+      (2026-09-29: 8/8 seeds, FLAG_SIGILL on boards 0 and 1, flags=0 with
+      a real checksum on board 2, every time - CONFIRMED as the sole
+      cause of mode 5's divergence. Boards 0/1's kernels do not permit
+      unprivileged (U-mode) rdcycle/rdtime/rdinstret reads - almost
+      certainly an mcounteren/scounteren default that differs between
+      each board's stock OS image, not a silicon/architectural
+      difference. A real, 100%-reproducible cross-board divergence -
+      the first one this system has confirmed - but a kernel/OS config
+      fact about this fleet rather than an architectural defect.)
 Only rl_host.exe's run1 mode can send diag_mode != 0; the rl/rl_scope
 bandit loop always sends 0 (or omits it), so a live campaign's results are
 unaffected by this field's existence.
@@ -552,10 +594,50 @@ static inline uint32_t amomaxu_w(volatile uint32_t *p, uint32_t val) {
 }
 
 //============================================================================
+//   RISC-V CSR Helpers
+//============================================================================
+//   rdcycle/rdtime/rdinstret read hardware counter CSRs. Whether a U-mode
+//   (unprivileged) program is allowed to read them at all is gated by the
+//   kernel's mcounteren/scounteren CSR configuration - a per-kernel-build
+//   decision, not something the RISC-V ISA itself guarantees. If a kernel
+//   doesn't permit it, the read raises an illegal-instruction exception
+//   (SIGILL to this process) instead of returning a value. Used by
+//   diag_mode 5 purely as a permission probe - see that section's comment
+//   for why the returned values are never folded into the checksum.
+//============================================================================
+
+static inline uint64_t read_csr_cycle(void) {
+    uint64_t val;
+    asm volatile ("rdcycle %0" : "=r"(val));
+    return val;
+}
+
+static inline uint64_t read_csr_time(void) {
+    uint64_t val;
+    asm volatile ("rdtime %0" : "=r"(val));
+    return val;
+}
+
+static inline uint64_t read_csr_instret(void) {
+    uint64_t val;
+    asm volatile ("rdinstret %0" : "=r"(val));
+    return val;
+}
+
+//============================================================================
 //   Deterministic Workload
 //============================================================================
 
 static uint32_t mem[MEM_WORDS];
+
+/*
+ * volatile so "fv / fp_div_zero" in the FP section below genuinely executes
+ * on the FPU at runtime instead of being constant-folded by the compiler at
+ * -O2 - the whole point of that construct is to observe what this board's
+ * hardware actually produces for 0.0 division, not a compile-time constant
+ * every board would trivially agree on.
+ */
+static volatile double fp_div_zero = 0.0;
 
 static inline uint32_t xorshift32(uint32_t *s) {
     uint32_t x = *s;
@@ -671,13 +753,16 @@ static run_result_t workload_windowed(uint32_t seed, int steps, int diag_mode) {
         for (int i = step_begin; i < step_end; i++) { /* Execute each step in this timing window. */
             uint32_t r = xorshift32(&st);            /* Generate the next deterministic pseudo-random value that drives this step’s behavior. */
 
-            /* ALU-heavy section */
+            /* ALU-heavy section - skipped in diag_mode 4 (FP-only bisection) */
+            if (diag_mode != 4) {
             acc ^= (r * 2654435761u);                /* Mix the random value into the accumulator with multiplication and XOR to exercise integer datapaths and create nontrivial data evolution. */
             acc += (acc << 7) ^ (r >> 3);            /* Combine shifts, XOR, and addition to create more varied arithmetic pressure and data dependencies. */
             acc = (acc << 3) | (acc >> 29);          /* Perform a rotate-like operation so bits move across positions and the accumulator remains highly mixed. */
+            }
 
-            /* Normal memory section - skipped when diag_mode == 1 (ALU-only bisection) */
-            if (diag_mode != 1) {
+            /* Normal memory section - skipped when diag_mode == 1 (ALU-only
+               bisection) or diag_mode == 4 (FP-only bisection) */
+            if (diag_mode != 1 && diag_mode != 4) {
             uint32_t idx = (r ^ acc) % MEM_WORDS;    /* Choose a memory index based on both current pseudo-random state and accumulator state, making accesses data-dependent and less predictable. */
             uint32_t v   = mem[idx];                 /* Load the current value from the selected scratch-memory location. */
 
@@ -719,7 +804,134 @@ static run_result_t workload_windowed(uint32_t seed, int steps, int diag_mode) {
             if (diag_mode == 0 && (r & 0x3FFu) == 0x155u) { /* Occasionally take an alternate path based on the pseudo-random pattern so the control-flow profile is not completely uniform. */
                 acc ^= 0xDEADBEEFu;                    /* Perturb the accumulator strongly when that rare condition is met, making branch timing and path differences visible in results. */
             }
-            } /* end: if (diag_mode != 1) - normal memory section */
+            } /* end: if (diag_mode != 1 && diag_mode != 4) - normal memory section */
+
+            /*
+             * Floating-point section (RV64GC D extension) - diag_mode 4
+             * only, isolated from every construct above (must be a sibling
+             * of the memory-section block above, not nested inside it,
+             * since that block is itself skipped whenever diag_mode == 4).
+             * Nothing else in this workload ever touches an FPU:
+             * ALU/memory/AMO/branch can only ever expose *integer*
+             * datapath, memory subsystem, and atomic-unit divergence,
+             * never FP divergence, no matter how long a campaign runs.
+             * This is a first, deliberately isolated slice to manually
+             * evaluate (via run1, not yet the live bandit) whether FP is
+             * even worth promoting into a real arm, per each construct's
+             * own comment below.
+             */
+            if (diag_mode == 4) {
+                double fv = (double)(int32_t)r;      /* Deterministic per-step FP seed value, reusing this step's PRNG output. */
+
+                /* Denormal (subnormal) generation: 1e-318 scales every
+                   nonzero int32_t magnitude (1 to 2^31) down into the
+                   double subnormal range (below ~2.2e-308, down to
+                   ~4.9e-324) without underflowing all the way to exact
+                   zero. Some FPU implementations compute subnormals
+                   precisely; others flush-to-zero (FTZ) for performance -
+                   a implementation-specific behavior this workload has no
+                   other way to expose. */
+                double denorm = fv * 1e-318;
+
+                /* Genuine hardware-computed NaN: fp_div_zero is volatile,
+                   so this division cannot be constant-folded away by the
+                   compiler - it actually executes on the FPU at runtime.
+                   The *fact* of being NaN is required by IEEE 754 and will
+                   agree everywhere, but the specific NaN bit pattern
+                   (sign + mantissa payload) that a 0.0/0.0 invalid
+                   operation produces is implementation-defined, not
+                   standardized - a genuine, legal source of cross-board
+                   divergence this system has never been able to see. */
+                double nan_val = fv / fp_div_zero;
+
+                /* Rounding-tie-sensitive value: 0.1 has no exact binary
+                   floating-point representation, and adding 1e16 pushes
+                   the result to a magnitude where the ULP is large enough
+                   that the final rounding step (round-to-nearest-even by
+                   IEEE 754 default) actually discards real information -
+                   exercises rounding-mode handling that plain integer ALU
+                   ops never touch. */
+                double tie = fv * 0.1 + 1e16;
+
+                /* Fold all three raw bit patterns into the running integer
+                   checksum, the same way the AMO section folds its "old"
+                   values back into acc - so FP divergence, if any exists,
+                   actually surfaces in the DONE line's checksum instead of
+                   being dead computation the optimizer could discard. */
+                uint64_t bits;
+                memcpy(&bits, &denorm, sizeof(bits));
+                acc ^= (uint32_t)(bits ^ (bits >> 32));
+                memcpy(&bits, &nan_val, sizeof(bits));
+                acc ^= (uint32_t)(bits ^ (bits >> 32));
+                memcpy(&bits, &tie, sizeof(bits));
+                acc ^= (uint32_t)(bits ^ (bits >> 32));
+            }
+
+            /*
+             * Misaligned-access + CSR-read section - diag_mode 5/6/7 only,
+             * isolated from every construct above (sibling block, same
+             * reasoning as the FP block: must not be nested inside a
+             * condition that's itself skipped for this mode).
+             *
+             * diag_mode 5 runs both constructs together; 6 and 7 bisect
+             * them apart, the same way modes 1/2/3 bisect ALU/memory/AMO -
+             * added after mode 5 hit FLAG_SIGILL on 8/8 seeds on boards 0
+             * and 1 but not board 2, to nail down definitively which of
+             * the two constructs is actually responsible before reporting
+             * that as a finding (SIGILL strongly implies the CSR probe,
+             * not the misaligned access, but "strongly implies" isn't
+             * "confirmed").
+             */
+            if (diag_mode == 5 || diag_mode == 6) {
+                /* Misaligned access: bytes reinterpreted from mem[] so a
+                   genuinely unaligned pointer can be formed. volatile so
+                   the compiler can't "fix" the misalignment away via a
+                   load/store-combining optimization - the point is to see
+                   what a real misaligned lh/lw does on this board's
+                   hardware or trap-and-emulate path. mem[] is always
+                   accessed 4-byte-aligned everywhere else in this
+                   workload; this deliberately breaks that for both a
+                   16-bit and a 32-bit access. */
+                volatile uint8_t *bytes = (volatile uint8_t *)mem;
+                size_t byte_len = sizeof(mem);
+
+                uint32_t base_idx = (r ^ acc) % MEM_WORDS;
+                size_t off16 = ((size_t)base_idx * 4u + 1u) % (byte_len - 4u);            /* always an odd (misaligned) byte offset */
+                size_t off32 = ((size_t)base_idx * 4u + 2u + (r & 1u)) % (byte_len - 4u); /* offset 2 or 3: misaligned for a 4-byte access */
+
+                volatile uint16_t *hp = (volatile uint16_t *)&bytes[off16];
+                uint16_t hv = *hp;                       /* Misaligned 16-bit load. */
+                hv = (uint16_t)(hv ^ (uint16_t)r ^ (uint16_t)acc);
+                *hp = hv;                                 /* Misaligned 16-bit store. */
+
+                volatile uint32_t *wp = (volatile uint32_t *)&bytes[off32];
+                uint32_t wv = *wp;                        /* Misaligned 32-bit load. */
+                wv ^= (r + acc);
+                wv += (wv << 9) ^ (wv >> 7);
+                *wp = wv;                                  /* Misaligned 32-bit store. */
+
+                acc ^= hv;
+                acc ^= wv;
+            }
+
+            if (diag_mode == 5 || diag_mode == 7) {
+                /* CSR probe: rdcycle/rdtime/rdinstret only succeed in
+                   U-mode if the kernel's mcounteren/scounteren CSR
+                   permits it - if not, this raises SIGILL, caught by the
+                   existing fault handler exactly like any other fault.
+                   The values themselves are read (asm volatile guarantees
+                   the instruction isn't optimized away) but deliberately
+                   discarded rather than folded into acc: they're
+                   free-running hardware counters, not reproducible across
+                   runs of the same seed, so letting them influence the
+                   checksum would break the one property (checksum is a
+                   pure function of (seed, steps)) this whole comparison
+                   depends on. Only whether reading them succeeds at all
+                   is the signal this probe produces. */
+                (void)read_csr_cycle();
+                (void)read_csr_time();
+                (void)read_csr_instret();
+            }
         }
 
         uint64_t w1 = monotonic_ticks_u64();          /* Record the end time of the current window. */
@@ -799,7 +1011,7 @@ int main(int argc, char **argv) {
             steps = WINDOW_SIZE * MAX_WINDOWS;
         }
 
-        if (diag_mode < 0 || diag_mode > 3) {
+        if (diag_mode < 0 || diag_mode > 7) {
             diag_mode = 0;
         }
 
