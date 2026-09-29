@@ -395,6 +395,30 @@ rigol_session_t *rigol_arm_single_capture(const rigol_config_t *config) {
             rl_log_message(RL_LOG_WARN, "Scope still reports STOP after :RUN; arming single-shot anyway");
         }
     }
+
+    /*
+     * Memory depth is set here - after :RUN has confirmed the scope left
+     * STOP - rather than earlier, right after *IDN?. An earlier attempt to
+     * set it immediately after *IDN? (while the scope was likely still
+     * sitting in STOP from the previous single-shot) left it silently on
+     * AUTO with no visible error. This scope's LXI/SCPI implementation has
+     * already shown it is picky about which acquisition state a command is
+     * sent in (see the :RUN/:SING race note below), so acquisition-mode
+     * changes are tried only once it's confirmed to be actively running.
+     */
+    if (config->memory_depth_points > 0) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), ":ACQ:MDEP %zu", config->memory_depth_points);
+        rigol_scpi_write(sock, cmd);
+
+        char mdep_readback[RIGOL_MAX_LINE];
+        rigol_scpi_query(sock, ":ACQ:MDEP?", mdep_readback, sizeof(mdep_readback));
+        rl_log_message(RL_LOG_INFO,
+                       "Requested memory depth %zu, scope reports it is now set to: %s",
+                       config->memory_depth_points,
+                       mdep_readback);
+    }
+
     rigol_scpi_write(sock, ":SING");
 
     rl_log_message(RL_LOG_INFO, "Rigol scope armed for single-shot acquisition");

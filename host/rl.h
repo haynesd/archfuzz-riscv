@@ -270,6 +270,25 @@ Fields:
                          by insufficient settling time after the previous
                          board's activity (e.g. a shared power rail not
                          having fully settled) rather than a wiring fault.
+  dump_waveform_dir    - optional directory to receive raw per-channel
+                         waveform samples (time_s,volts CSV, one file per
+                         board per dumped iteration), or NULL to disable.
+                         Only meaningful with a Rigol config (rl_scope).
+                         This is a diagnostic escape hatch: normal operation
+                         only ever sees the reduced scalar metrics
+                         (energy/peak/rms/etc.) baked into the results CSV,
+                         which makes it impossible to visually confirm a
+                         capture is actually a real workload-driven current
+                         burst rather than noise or a misaligned window.
+                         Dumping a handful of raw traces lets you plot them
+                         directly and check for a visible step at the
+                         trigger, held for roughly the run's total_ns, then
+                         a step back to baseline.
+  dump_waveform_count  - number of iterations' worth of raw waveforms to
+                         dump before dumping stops (to avoid an unbounded
+                         diagnostic run filling the disk). Ignored when
+                         dump_waveform_dir is NULL. 0 with a non-NULL dir
+                         defaults to 5 iterations.
 -------------------------------------------------------------------------------
 */
 typedef struct {
@@ -279,6 +298,8 @@ typedef struct {
     int checkpoint_interval;
     int skip_board;
     int board_delay_ms;
+    const char *dump_waveform_dir;
+    int dump_waveform_count;
 } rl_run_options_t;
 
 /*

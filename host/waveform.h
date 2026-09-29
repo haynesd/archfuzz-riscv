@@ -165,6 +165,38 @@ bool waveform_extract_window(const waveform_t *source,
 
 /*
 -------------------------------------------------------------------------------
+waveform_subtract_baseline
+-------------------------------------------------------------------------------
+Removes each channel's own DC/quiescent operating point before comparison.
+
+A power channel's absolute level reflects that channel's current-sense probe
+gain/offset and the board's quiescent draw, not the workload - three boards
+on three different probe channels routinely sit at different absolute
+levels even when their *dynamic* (workload-driven) behavior is identical.
+Left in, that fixed per-channel offset saturates the relative-delta scalar
+metrics in waveform_compare_pair() toward their ceiling on nearly every
+capture, masking any real power divergence the workload itself causes.
+
+This computes the mean level over the leading pre_trigger_samples of the
+window (the portion captured *before* the workload-triggering edge, i.e.
+each channel's own quiescent baseline) and subtracts it from every sample,
+then recomputes metrics on the baseline-removed signal. Call this on each
+power channel's extracted window before waveform_compare_pair()/
+waveform_analyze_triplet() - not on the trigger channel, which only needs
+the raw signal for edge detection.
+
+Parameters:
+  window              - extracted power-channel window to baseline-correct
+                         in place (volts and metrics are both updated).
+  pre_trigger_samples - number of leading samples treated as the quiescent
+                         baseline region; clamped to the window's actual
+                         sample count.
+-------------------------------------------------------------------------------
+*/
+void waveform_subtract_baseline(waveform_t *window, size_t pre_trigger_samples);
+
+/*
+-------------------------------------------------------------------------------
 waveform_compare_pair
 -------------------------------------------------------------------------------
 Compares two aligned waveforms using normalized scalar deltas and an L1 trace

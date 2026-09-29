@@ -123,6 +123,29 @@ bool waveform_extract_window(const waveform_t *source,
     return out_window->metrics.valid;
 }
 
+void waveform_subtract_baseline(waveform_t *window, size_t pre_trigger_samples) {
+    if (!window || !window->volts || window->sample_count == 0) {
+        return;
+    }
+
+    size_t n = pre_trigger_samples < window->sample_count ? pre_trigger_samples : window->sample_count;
+    if (n == 0) {
+        return;
+    }
+
+    double baseline = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        baseline += window->volts[i];
+    }
+    baseline /= (double)n;
+
+    for (size_t i = 0; i < window->sample_count; ++i) {
+        window->volts[i] -= baseline;
+    }
+
+    window->metrics = waveform_compute_metrics(window->volts, window->sample_count, window->dt_s);
+}
+
 wave_pair_diff_t waveform_compare_pair(const waveform_t *a, const waveform_t *b) {
     wave_pair_diff_t diff;
     memset(&diff, 0, sizeof(diff));
@@ -209,6 +232,11 @@ wave_diff_summary_t waveform_align_and_analyze_capture_set(
             }
             return summary;
         }
+        /* Remove this channel's own quiescent DC level (from the pre-trigger
+           portion of the window) before comparison, so cross-board probe
+           offset differences don't saturate the relative-delta metrics -
+           see waveform_subtract_baseline() doc for why. */
+        waveform_subtract_baseline(&local_aligned[i], pre_trigger_samples);
     }
 
     summary = waveform_analyze_triplet(local_aligned);

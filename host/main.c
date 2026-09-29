@@ -34,7 +34,14 @@ static void print_usage_and_exit(void) {
         "  rl_host.exe run1 <COM_PORT> <BOARD> <SEED> <STEPS> [DIAG_MODE]\n"
         "  rl_host.exe rl <COM_PORT> <SEED_START> <SEED_END>\n"
         "  rl_host.exe rl_scope <COM_PORT> <SEED_START> <SEED_END> <SCOPE_IP> <SCOPE_PORT> "
-        "[PRE_TRIGGER_SAMPLES] [WINDOW_SAMPLES] [TRIGGER_THRESHOLD_V] [TIMEBASE_SCALE_S] [TIMEBASE_OFFSET_S]\n\n"
+        "[PRE_TRIGGER_SAMPLES] [WINDOW_SAMPLES] [TRIGGER_THRESHOLD_V] [TIMEBASE_SCALE_S] [TIMEBASE_OFFSET_S] [MEMORY_DEPTH]\n\n"
+        "MEMORY_DEPTH (rl_scope only, optional, requires both timebase args present) -\n"
+        "points per channel to request via :ACQ:MDEP before arming. Needed because\n"
+        "WINDOW_SAMPLES can only select a sub-range of what the scope actually\n"
+        "acquired - requesting a window larger than the current memory depth just\n"
+        "gets silently truncated. Check the \"Captured ...: samples=\" log line\n"
+        "against what you requested; the scope may round to its nearest supported\n"
+        "value rather than reject an unsupported one.\n\n"
         "rl_scope channel model:\n"
         "  CH1 = Board A power\n"
         "  CH2 = Board B power\n"
@@ -56,7 +63,14 @@ static void print_usage_and_exit(void) {
         "  --board-delay-ms <N>        pause N ms before addressing each board within an\n"
         "                              iteration - diagnostic for testing whether a link is\n"
         "                              being disturbed by insufficient settling time after\n"
-        "                              the previous board's activity (default 0, no delay)\n\n"
+        "                              the previous board's activity (default 0, no delay)\n"
+        "  --dump-waveform <DIR>       write raw per-channel waveform samples (time_s,volts\n"
+        "                              CSV) to DIR for the first few valid rl_scope\n"
+        "                              iterations, so a capture can be plotted and visually\n"
+        "                              confirmed as a real workload-driven current burst\n"
+        "                              instead of trusting only the reduced scalar metrics\n"
+        "  --dump-waveform-count <N>   number of iterations to dump before stopping\n"
+        "                              (default 5). Ignored without --dump-waveform\n\n"
         "DIAG_MODE (run1 only, optional, default 0) - for manually bisecting a\n"
         "cross-board checksum divergence down to a specific workload construct:\n"
         "  0 = full workload (default): ALU + memory + AMO(1/32 steps) + branch(1/1024 steps)\n"
@@ -72,6 +86,8 @@ static void print_usage_and_exit(void) {
         "  rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555\n"
         "  rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555 32 512 1.0\n"
         "  rl_host.exe --checkpoint run1.ckpt --results run1.csv rl_scope COM5 16 65536 192.168.1.178 5555 32 512 1.0 0.001 0.0\n"
+        "  rl_host.exe --dump-waveform wavedump rl_scope COM5 16 65536 192.168.1.178 5555 200 50000 0.15\n"
+        "  rl_host.exe rl_scope COM5 16 65536 192.168.1.178 5555 2000 500000 0.15 0.0 0.0 3000000\n"
     );
 }
 
@@ -144,6 +160,22 @@ int main(int argc, char **argv) {
             argi += 2;
             continue;
         }
+        if (strcmp(argv[argi], "--dump-waveform") == 0) {
+            if (argi + 1 >= argc) {
+                print_usage_and_exit();
+            }
+            options.dump_waveform_dir = argv[argi + 1];
+            argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "--dump-waveform-count") == 0) {
+            if (argi + 1 >= argc) {
+                print_usage_and_exit();
+            }
+            options.dump_waveform_count = parse_int_decimal(argv[argi + 1], "DUMP_WAVEFORM_COUNT");
+            argi += 2;
+            continue;
+        }
         break;
     }
 
@@ -178,7 +210,7 @@ int main(int argc, char **argv) {
                           NULL,
                           &options);
     } else if (strcmp(argv[argi], "rl_scope") == 0) {
-        if ((argc - argi) != 6 && (argc - argi) != 9 && (argc - argi) != 11) {
+        if ((argc - argi) != 6 && (argc - argi) != 9 && (argc - argi) != 11 && (argc - argi) != 12) {
             print_usage_and_exit();
         }
 
@@ -203,9 +235,13 @@ int main(int argc, char **argv) {
             rigol.trigger_threshold_v = strtod(argv[argi + 8], NULL);
         }
 
-        if ((argc - argi) == 11) {
+        if ((argc - argi) >= 11) {
             rigol.timebase_scale_s = strtod(argv[argi + 9], NULL);
             rigol.timebase_offset_s = strtod(argv[argi + 10], NULL);
+        }
+
+        if ((argc - argi) == 12) {
+            rigol.memory_depth_points = (size_t)parse_u32_decimal(argv[argi + 11], "MEMORY_DEPTH");
         }
 
         rigol_net_init();

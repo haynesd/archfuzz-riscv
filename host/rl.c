@@ -54,12 +54,30 @@ SIGBUS/SIGFPE handling: a board whose kernel delivers one of those signals
 mid-workload reports a nonzero flags value instead of crashing silently,
 and this term rewards that heavily (+1e6) since it is the strongest
 possible defect signal this system can produce.
+
+D_timing/D_power rebalance (2026-09-28): an overnight campaign
+(overnight_9_27_2026.csv, 10950 rows) showed reward was almost entirely
+driven by raw worst_ns deltas - board-to-board clock-speed skew alone
+routinely put those in the hundreds of thousands to low millions of
+nanoseconds, since worst_ns is raw wall-clock time with no normalization,
+unlike D_semantic which already divides checksum delta by 1000. That
+drowned out D_power, whose gamma*grand_total term topped out around 8-9k
+(RL_GAMMA=1000 times a scalar+trace total bounded near ~12-13) and could
+never move reward relative to timing spikes 100-1000x larger. Fixed two
+ways: RL_TIMING_NS_SCALE normalizes worst_ns deltas the same way
+D_semantic already normalizes checksum deltas, and RL_GAMMA is raised
+now that waveform_subtract_baseline() (see waveform.c) removes each
+channel's fixed DC offset before comparison, giving D_power more real
+dynamic range to reward instead of sitting near a saturated ceiling.
+Both are starting points - retune against a fresh campaign's reward/digital
+distribution once baseline-subtracted wave data is available.
 -------------------------------------------------------------------------------
 */
-#define RL_ALPHA 1.0    /* D_semantic weight */
-#define RL_BETA  1.0    /* D_timing weight   */
-#define RL_GAMMA 1000.0 /* D_power weight    */
-#define RL_DELTA 1.0    /* D_fault weight    */
+#define RL_ALPHA 1.0     /* D_semantic weight */
+#define RL_BETA  1.0     /* D_timing weight   */
+#define RL_GAMMA 20000.0 /* D_power weight    */
+#define RL_DELTA 1.0     /* D_fault weight    */
+#define RL_TIMING_NS_SCALE 1000.0 /* worst_ns delta divisor, mirrors D_semantic's checksum/1000 */
 
 bool rl_parse_done_line(const char *line, int board_index, triple_result_t *result) {
     unsigned seed = 0;
@@ -113,6 +131,7 @@ double rl_compute_digital_divergence(const triple_result_t *result, int skip_boa
         }
     }
     d_semantic /= 1000.0;
+    timing_ns_term /= RL_TIMING_NS_SCALE;
 
     double d_fault = 0.0;
     for (int i = 0; i < RL_BOARD_COUNT; ++i) {
@@ -295,7 +314,7 @@ static void rl_results_open(const char *path) {
                 "checksum0,checksum1,checksum2,total_ns0,total_ns1,total_ns2,flags0,flags1,flags2,"
                 "worst_window0,worst_window1,worst_window2,"
                 "worst_ns0,worst_ns1,worst_ns2,"
-                "wave_valid,wave_grand_total\n");
+                "wave_valid,wave_grand_total,wave_pair01,wave_pair02,wave_pair12\n");
         fflush(g_results_file);
     }
 
@@ -314,12 +333,14 @@ static void rl_results_write_row(uint64_t iteration,
         return;
     }
 
+    bool wave_ok = wave_summary && wave_summary->valid;
+
     fprintf(g_results_file,
             "%" PRIu64 ",%u,%d,%d,%" PRIu64 ",%.6f,%.6f,%.6f,"
             "%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%u,%u,"
             "%u,%u,%u,"
             "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-            "%d,%.6f\n",
+            "%d,%.6f,%.6f,%.6f,%.6f\n",
             iteration, result->seed, result->steps, arm_steps, pulls, mean_reward, digital, reward,
             result->checksum[0], result->checksum[1], result->checksum[2],
             result->total_ns[0], result->total_ns[1], result->total_ns[2],
@@ -327,7 +348,10 @@ static void rl_results_write_row(uint64_t iteration,
             result->worst_window[0], result->worst_window[1], result->worst_window[2],
             result->worst_ns[0], result->worst_ns[1], result->worst_ns[2],
             wave_summary ? (int)wave_summary->valid : 0,
-            wave_summary ? wave_summary->grand_total : 0.0);
+            wave_summary ? wave_summary->grand_total : 0.0,
+            wave_ok ? wave_summary->pair01.total : 0.0,
+            wave_ok ? wave_summary->pair02.total : 0.0,
+            wave_ok ? wave_summary->pair12.total : 0.0);
     fflush(g_results_file);
 }
 
@@ -410,6 +434,65 @@ static uint64_t rl_checkpoint_load(const char *path, rl_arm_t *arms, int arm_cou
     return iteration;
 }
 
+/*
+-------------------------------------------------------------------------------
+rl_dump_waveform_csv
+-------------------------------------------------------------------------------
+Writes one aligned power-channel waveform to <dir>/iter<N>_seed<S>_board<B>.csv
+as plain time_s,volts rows, so it can be plotted and visually inspected. This
+exists because the normal reward path only ever sees the reduced scalar
+metrics (energy/peak/rms/etc.) - there was previously no way to confirm a
+capture is actually a real workload-driven current burst (a visible step at
+the trigger, held for roughly the run's total_ns, then a step back to
+baseline) rather than noise or a window that doesn't span the real burst.
+-------------------------------------------------------------------------------
+*/
+static void rl_dump_waveform_csv(const char *dir, uint64_t iteration, uint32_t seed, int board_index, const waveform_t *wave) {
+    if (!wave->time_s || !wave->volts || wave->sample_count == 0) {
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/iter%" PRIu64 "_seed%u_board%d.csv", dir, iteration, seed, board_index);
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        rl_log_message(RL_LOG_WARN, "Could not open waveform dump file: %s", path);
+        return;
+    }
+
+    fprintf(f, "time_s,volts\n");
+    for (size_t i = 0; i < wave->sample_count; ++i) {
+        fprintf(f, "%.9e,%.9e\n", wave->time_s[i], wave->volts[i]);
+    }
+    fclose(f);
+
+    rl_log_message(RL_LOG_INFO, "Dumped raw waveform: %s (%zu samples)", path, wave->sample_count);
+}
+
+/*
+-------------------------------------------------------------------------------
+rl_report_wave_outage
+-------------------------------------------------------------------------------
+Escalates a run of consecutive failed/invalid power captures into a loud,
+infrequent log line, on top of the per-iteration WARN already emitted at the
+call site. A single missed capture is routine (trigger jitter, an occasional
+dropped SCPI exchange); a long run of them means the scope link or trigger
+is actually down for the rest of the campaign, which previously produced no
+signal beyond an easy-to-miss WARN once per iteration for hours on end.
+-------------------------------------------------------------------------------
+*/
+static void rl_report_wave_outage(uint64_t consecutive_failures) {
+    if (consecutive_failures == 10 || consecutive_failures == 50 ||
+        (consecutive_failures >= 100 && consecutive_failures % 200 == 0)) {
+        rl_log_message(RL_LOG_ERROR,
+                       "Power capture has failed %" PRIu64
+                       " iterations in a row - scope link or trigger is likely down; "
+                       "board-only data is still being collected",
+                       consecutive_failures);
+    }
+}
+
 int rl_mode_loop(const char *com_port,
                  uint32_t seed_lo,
                  uint32_t seed_hi,
@@ -419,7 +502,16 @@ int rl_mode_loop(const char *com_port,
         die("SEED_END must be >= SEED_START");
     }
 
-    static const rl_run_options_t default_options = {0, NULL, NULL, 0, -1, 0};
+    static const rl_run_options_t default_options = {
+        .rng_seed = 0,
+        .results_path = NULL,
+        .checkpoint_path = NULL,
+        .checkpoint_interval = 0,
+        .skip_board = -1,
+        .board_delay_ms = 0,
+        .dump_waveform_dir = NULL,
+        .dump_waveform_count = 0,
+    };
     if (!options) {
         options = &default_options;
     }
@@ -432,6 +524,15 @@ int rl_mode_loop(const char *com_port,
     }
     if (options->board_delay_ms > 0) {
         rl_log_message(RL_LOG_INFO, "Inter-board delay: %d ms before addressing each board", options->board_delay_ms);
+    }
+
+    int waveform_dump_limit = options->dump_waveform_count > 0 ? options->dump_waveform_count : 5;
+    int waveform_dumps_written = 0;
+    if (options->dump_waveform_dir) {
+        rl_log_message(RL_LOG_INFO,
+                       "Raw waveform dump enabled: dir=%s, first %d valid iteration(s)",
+                       options->dump_waveform_dir,
+                       waveform_dump_limit);
     }
 
     serial_t serial = serial_open(com_port);
@@ -453,11 +554,33 @@ int rl_mode_loop(const char *com_port,
 
     char line[512];
 
+    /*
+     * Tracks consecutive failed/invalid scope captures so a dead Rigol link
+     * or trigger gets noticed loudly instead of silently degrading a whole
+     * unattended campaign. overnight_9_27_2026.csv (2026-09-27) ran 10950
+     * iterations but wave_valid went to 0 at iteration 6896 and stayed
+     * there for the rest of the night (4054 rows, ~37% of the campaign)
+     * with nothing in the log calling that out - board data kept flowing
+     * normally so nothing else looked wrong. Escalating log lines below
+     * make that state visible within minutes instead of the next morning.
+     */
+    uint64_t consecutive_wave_failures = 0;
+
     while (true) {
         int arm_index = rl_choose_ucb_arm(arms, RL_ARM_COUNT);
         int steps = arms[arm_index].steps;
-        uint32_t span = seed_hi - seed_lo + 1;
-        uint32_t seed = seed_lo + (rl_rng_next(&rng_state) % span);
+        /*
+         * span must be computed in 64 bits: a full-range campaign
+         * (seed_lo=0, seed_hi=UINT32_MAX) makes seed_hi - seed_lo + 1
+         * overflow to 0 in uint32_t, and the modulo below then divides by
+         * zero - an unhandled hardware trap that kills the process with no
+         * diagnostic output at all (crashed on the very first iteration,
+         * before any board/scope activity, while launching the
+         * 2026-09-28 overnight campaign at the user's requested full
+         * 32-bit seed range). The 64-bit span has no such overflow case.
+         */
+        uint64_t span = (uint64_t)seed_hi - (uint64_t)seed_lo + 1;
+        uint32_t seed = seed_lo + (uint32_t)(rl_rng_next(&rng_state) % span);
 
         triple_result_t result;
         memset(&result, 0, sizeof(result));
@@ -537,6 +660,7 @@ int rl_mode_loop(const char *com_port,
                 aligned);
 
             if (wave_summary.valid) {
+                consecutive_wave_failures = 0;
                 wave_summary_ptr = &wave_summary;
 
                 for (int i = 0; i < RL_BOARD_COUNT; ++i) {
@@ -547,6 +671,16 @@ int rl_mode_loop(const char *com_port,
                 waveform_log_pair("02", &wave_summary.pair02);
                 waveform_log_pair("12", &wave_summary.pair12);
 
+                if (options->dump_waveform_dir && waveform_dumps_written < waveform_dump_limit) {
+                    for (int i = 0; i < RL_BOARD_COUNT; ++i) {
+                        rl_dump_waveform_csv(options->dump_waveform_dir, iteration, seed, i, &aligned[i]);
+                    }
+                    waveform_dumps_written++;
+                    if (waveform_dumps_written == waveform_dump_limit) {
+                        rl_log_message(RL_LOG_INFO, "Raw waveform dump limit reached (%d iterations); dumping stops here", waveform_dump_limit);
+                    }
+                }
+
                 rl_log_message(RL_LOG_INFO,
                                "Aligned scope window: trigger_idx=%zu start=%zu samples=%zu total=%.6f",
                                wave_summary.trigger_index,
@@ -554,13 +688,27 @@ int rl_mode_loop(const char *com_port,
                                wave_summary.window_samples,
                                wave_summary.grand_total);
             } else {
-                rl_log_message(RL_LOG_WARN, "Aligned scope analysis unavailable for this iteration");
+                consecutive_wave_failures++;
+                rl_log_message(RL_LOG_WARN,
+                               "Aligned scope analysis unavailable for this iteration (%" PRIu64 " consecutive)",
+                               consecutive_wave_failures);
+                rl_report_wave_outage(consecutive_wave_failures);
             }
 
             for (int i = 0; i < RL_BOARD_COUNT; ++i) {
                 waveform_free(&aligned[i]);
             }
             waveform_capture_set_free(&capture);
+        } else if (rigol && rigol->enabled) {
+            /* rigol_arm_single_capture() failed to produce a session even
+               though a scope was configured and enabled - counts the same
+               as a failed capture so an outage during the arm step (not
+               just the read-back step) is still caught. */
+            consecutive_wave_failures++;
+            rl_log_message(RL_LOG_WARN,
+                           "Failed to arm scope capture for this iteration (%" PRIu64 " consecutive)",
+                           consecutive_wave_failures);
+            rl_report_wave_outage(consecutive_wave_failures);
         }
 
         double digital = rl_compute_digital_divergence(&result, options->skip_board);

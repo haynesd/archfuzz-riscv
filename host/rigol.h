@@ -50,6 +50,23 @@ typedef struct {
      */
     double timebase_scale_s;
     double timebase_offset_s;
+    /*
+     * Optional explicit acquisition memory depth (points per channel), sent
+     * via ":ACQ:MDEP <N>" before arming. 0 leaves memory depth exactly as
+     * manually configured on the front panel (prior behavior). Needed
+     * because a large window_samples request silently gets truncated by the
+     * scope once it exceeds whatever memory depth happens to already be
+     * configured - :WAV:STAR/:WAV:STOP can only select a sub-range of what
+     * was actually acquired, they cannot make the scope acquire more than
+     * its current memory depth allows. Discovered by requesting a window
+     * of ~500k samples and getting back only ~152k regardless. Only
+     * specific values are valid per Rigol's own memory-depth menu (varies
+     * by model and by how many channels are active) - if the value here
+     * doesn't match one of those, the scope will typically round it to the
+     * nearest supported value rather than reject it outright, so check the
+     * "Captured ...: samples=" log line against what you asked for.
+     */
+    size_t memory_depth_points;
     bool enabled;
 } rigol_config_t;
 
